@@ -4,6 +4,7 @@
 //! exercisable both by the application binary and by integration tests
 //! under `tests/`.
 
+pub mod annotations;
 pub mod document;
 pub mod form_fields;
 pub mod overlay;
