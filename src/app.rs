@@ -51,11 +51,16 @@ pub struct PdfUtilityApp {
     /// The name of the AcroForm text field currently shown as an inline
     /// editor, if the user has clicked one. `None` means no editor is shown.
     focused_field: Option<String>,
-    /// This session's typed values for text fields, keyed by field name.
-    /// Used to seed the inline editor's buffer so switching focus away from
-    /// a field and back doesn't lose what was typed into it, since
-    /// `form_fields` exposes no way to read a field's current value back out
-    /// of the document.
+    /// This session's in-progress values for text fields, keyed by field
+    /// name. The first time a field is focused (in `handle_canvas_click`),
+    /// its entry is seeded from the document's real current value via
+    /// `form_fields::get_field_value` (falling back to empty only if
+    /// pdfium reports none) — never unconditionally defaulted to empty —
+    /// so a field that already has content (a pre-filled template, or a
+    /// document re-opened after partial filling by another tool) doesn't
+    /// get silently blanked out by the inline editor. After that, this map
+    /// just tracks the editor's live buffer so switching focus away from a
+    /// field and back doesn't lose what was typed into it.
     field_values: HashMap<String, String>,
 }
 
@@ -245,8 +250,21 @@ impl PdfUtilityApp {
         if let Some(field) = form_fields::hit_test(&fields, page_point)
             && field.kind == FieldKind::Text
         {
-            self.focused_field = Some(field.name.clone());
-            self.field_values.entry(field.name.clone()).or_default();
+            let name = field.name.clone();
+            self.focused_field = Some(name.clone());
+            // Seed the editor's buffer from the field's real current value
+            // the first time it's focused in this session, rather than
+            // unconditionally defaulting to empty — a text field opened
+            // from a pre-filled template, or a document re-opened after
+            // partial filling by another tool, may already carry real
+            // content, and unconditionally starting from an empty buffer
+            // would silently discard it on the first keystroke. Once a
+            // field has an entry in `field_values` (even an empty one,
+            // e.g. because the user cleared it), that entry is left alone
+            // so in-session edits aren't clobbered by re-focusing.
+            self.field_values.entry(name).or_insert_with(|| {
+                form_fields::get_field_value(document, &field.name).unwrap_or_default()
+            });
         }
         // FieldKind::Other, or no field at all: no-op, per the Review Focus
         // requirement and Task 5's scope, respectively (see doc comment).
@@ -277,6 +295,11 @@ impl PdfUtilityApp {
         let scroll_offset = -image_rect.min.to_vec2();
         let screen_rect = canvas::page_rect_to_screen(field_rect, zoom, scroll_offset);
 
+        // `handle_canvas_click` always seeds `field_values[name]` (from the
+        // field's real current value, falling back to empty only if pdfium
+        // reports none) before setting `focused_field`, so this entry
+        // already exists by the time we get here; `.or_default()` is just a
+        // defensive fallback, not the normal seeding path.
         let buffer = self.field_values.entry(name.clone()).or_default();
         let response = ui.put(screen_rect, egui::TextEdit::singleline(buffer));
         let changed_value = response.changed().then(|| buffer.clone());

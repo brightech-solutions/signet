@@ -102,6 +102,41 @@ pub fn hit_test<'a>(
         .find(|field| field.page_rect.contains(page_point))
 }
 
+/// Returns the current value of the text field named `name`, searching
+/// every page of `doc`, or `None` if no field with that name exists, it
+/// exists but isn't a text field, or it exists and is a text field but has
+/// no value set.
+///
+/// Callers that seed an editable buffer from a field (e.g. the inline
+/// text-field editor in `app.rs`) must use this rather than defaulting to
+/// an empty string, since a text field opened from a pre-filled template or
+/// a document re-opened after partial filling may already carry real
+/// content that must not be silently discarded on the first edit.
+pub fn get_field_value(doc: &PdfDocumentState, name: &str) -> Option<String> {
+    let document = doc.inner();
+
+    for page_index in 0..document.pages().len() {
+        let page = document.pages().get(page_index).ok()?;
+        let annotations = page.annotations();
+
+        for annotation in annotations.iter() {
+            let Some(field) = annotation.as_form_field() else {
+                continue;
+            };
+
+            if field.name().as_deref() != Some(name) {
+                continue;
+            }
+
+            return field
+                .as_text_field()
+                .and_then(|text_field| text_field.value());
+        }
+    }
+
+    None
+}
+
 /// Sets the value of the text field named `name`, searching every page of
 /// `doc`.
 ///
