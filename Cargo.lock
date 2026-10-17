@@ -2789,6 +2789,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "once_cell",
  "pdfium-render",
  "rfd",
  "serde",
