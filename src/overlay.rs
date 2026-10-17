@@ -27,10 +27,13 @@ pub struct TextBoxElement {
     pub text: String,
 }
 
-/// A placed signature image. Fully defined in Task 8; stubbed here with
-/// just enough fields for [`OverlayElement`] to compile and for
-/// [`OverlayLayer`]'s move/resize/delete mechanics (shared with text boxes)
-/// to apply to it too.
+/// A placed signature image: either an uploaded photo/scan or a rasterized
+/// typed name (see `crate::signatures::render_signature_entry`), already
+/// rendered to pixels by the time it becomes a `SignatureElement` — this
+/// struct itself doesn't care which. `rect` is in the same page-space
+/// coordinate system as [`TextBoxElement::rect`], and shares the exact
+/// same selection/move/resize/delete mechanics via [`OverlayLayer`] below;
+/// nothing about those mechanics is specific to either variant.
 #[derive(Debug, Clone)]
 pub struct SignatureElement {
     pub id: Uuid,

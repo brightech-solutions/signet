@@ -168,10 +168,15 @@ pub fn read_overlay_from_annotations(
                 text,
             }));
         } else if annotation.as_stamp_annotation().is_some() {
+            // `get_raw_image` explicitly ignores the image's soft mask —
+            // i.e. it would hand back a signature's alpha channel as
+            // fully opaque everywhere, destroying its transparency.
+            // `get_processed_image` takes the mask (and any transform)
+            // into account, which is what a round trip needs here.
             let Some(image) = annotation
                 .objects()
                 .iter()
-                .find_map(|object| object.as_image_object()?.get_raw_image().ok())
+                .find_map(|object| object.as_image_object()?.get_processed_image(document).ok())
             else {
                 continue;
             };

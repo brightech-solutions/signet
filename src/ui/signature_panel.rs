@@ -23,26 +23,24 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use pdf_utility::signatures::{SignatureLibrary, SignatureSource};
+use pdf_utility::signatures::{DEFAULT_FONT_ID, SCRIPT_FONT_ID, SignatureLibrary, SignatureSource};
 use uuid::Uuid;
 
-/// The `font_id` stored for a typed signature rendered in the bundled
-/// script font.
-pub const SCRIPT_FONT_ID: &str = "shadows-into-light";
 /// The egui font name [`SCRIPT_FONT_ID`] resolves to. Must match the name
 /// passed to `egui::Context::add_font` in `src/main.rs`'s
 /// `FontInsert::new`, since that's the name `font_family_for` builds an
 /// `egui::FontFamily::Name` from.
 pub const SCRIPT_FONT_NAME: &str = "ShadowsIntoLight";
-/// The `font_id` stored for a typed signature rendered in egui's own
-/// default (non-script) font — the fallback choice for anyone who doesn't
-/// want a handwriting style.
-pub const DEFAULT_FONT_ID: &str = "default";
 
 /// Font choices offered in the "Add typed…" dropdown: a stable `font_id`
 /// (persisted verbatim in `SignatureEntry::source`, see
 /// `pdf_utility::signatures::SignatureSource::Typed`) paired with the label
-/// shown in the dropdown.
+/// shown in the dropdown. `SCRIPT_FONT_ID`/`DEFAULT_FONT_ID` are defined in
+/// `pdf_utility::signatures` (not here) so that
+/// `signatures::render_signature_entry` — which renders a typed entry's
+/// text at placement time — matches against the exact same ids this
+/// dropdown writes, with no second copy of the strings to drift out of
+/// sync.
 pub const FONT_CHOICES: &[(&str, &str)] = &[
     (SCRIPT_FONT_ID, "Shadows Into Light (script)"),
     (DEFAULT_FONT_ID, "Default"),
@@ -94,11 +92,23 @@ impl SignaturePanelState {
     /// `egui::Panel`/`SidePanel`'s `show`). `library` is mutated directly
     /// by the add/delete actions below and saved to `dir` immediately
     /// after each one.
-    pub fn ui(&mut self, ui: &mut egui::Ui, library: &mut SignatureLibrary, dir: &Path) {
+    ///
+    /// Returns the id of a library entry the user clicked "Place on page"
+    /// for this frame, if any — placement itself (rendering the entry via
+    /// `pdf_utility::signatures::render_signature_entry` and dropping it
+    /// onto the canvas on the next click) is driven by the caller
+    /// (`PdfUtilityApp`), which owns the canvas and the overlay layer this
+    /// panel has no access to.
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        library: &mut SignatureLibrary,
+        dir: &Path,
+    ) -> Option<Uuid> {
         ui.heading("Signatures");
         ui.separator();
 
-        self.draw_entries(ui, library, dir);
+        let place_requested = self.draw_entries(ui, library, dir);
 
         ui.separator();
         self.draw_add_image(ui, library, dir);
@@ -110,10 +120,21 @@ impl SignaturePanelState {
             ui.separator();
             ui.colored_label(egui::Color32::from_rgb(200, 40, 40), error);
         }
+
+        place_requested
     }
 
-    fn draw_entries(&mut self, ui: &mut egui::Ui, library: &mut SignatureLibrary, dir: &Path) {
+    /// Draws every saved entry as a row (thumbnail, name, "Place on page",
+    /// "Delete"). Returns the id behind a clicked "Place on page" this
+    /// frame, if any.
+    fn draw_entries(
+        &mut self,
+        ui: &mut egui::Ui,
+        library: &mut SignatureLibrary,
+        dir: &Path,
+    ) -> Option<Uuid> {
         let mut to_remove: Option<Uuid> = None;
+        let mut to_place: Option<Uuid> = None;
 
         // Snapshot ids/sources up front: `draw_thumbnail` below needs a
         // mutable borrow of `self.thumbnails` while iterating, which can't
@@ -130,6 +151,9 @@ impl SignaturePanelState {
             ui.horizontal(|ui| {
                 self.draw_thumbnail(ui, library, dir, id, &source);
                 ui.label(&name);
+                if ui.small_button("Place on page").clicked() {
+                    to_place = Some(id);
+                }
                 if ui.small_button("Delete").clicked() {
                     to_remove = Some(id);
                 }
@@ -141,6 +165,8 @@ impl SignaturePanelState {
             self.thumbnails.remove(&id);
             let _ = library.save(dir);
         }
+
+        to_place
     }
 
     /// Draws a single entry's thumbnail: a GPU texture (cached in

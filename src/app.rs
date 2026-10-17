@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use pdf_utility::document::{DocumentError, PdfDocumentState};
 use pdf_utility::form_fields::{self, FieldKind};
-use pdf_utility::overlay::{self, OverlayElement, OverlayLayer, TextBoxElement};
-use pdf_utility::signatures::SignatureLibrary;
+use pdf_utility::overlay::{self, OverlayElement, OverlayLayer, SignatureElement, TextBoxElement};
+use pdf_utility::signatures::{self, SignatureLibrary};
 use uuid::Uuid;
 
 use crate::ui::canvas;
@@ -24,21 +24,31 @@ const ZOOM_STEP: f32 = 0.25;
 
 /// Default size (page points) for a newly-placed free-form text box.
 const DEFAULT_TEXT_BOX_SIZE: egui::Vec2 = egui::vec2(160.0, 40.0);
-/// Smallest size (page points) a text box can be resized down to — a floor
-/// so dragging a corner past its opposite edge can't collapse or invert
-/// the box.
-const MIN_TEXT_BOX_SIZE: egui::Vec2 = egui::vec2(24.0, 16.0);
+/// Default width (page points) for a newly-placed signature; its height
+/// follows from the rendered image's aspect ratio (see
+/// `default_signature_rect`), so a wide scan and a short typed name both
+/// land at a sensible page size rather than their raw pixel dimensions.
+const DEFAULT_SIGNATURE_WIDTH: f32 = 160.0;
+/// Smallest size (page points) an overlay element (text box or signature)
+/// can be resized down to — a floor so dragging a corner past its opposite
+/// edge can't collapse or invert the element.
+const MIN_OVERLAY_ELEMENT_SIZE: egui::Vec2 = egui::vec2(24.0, 16.0);
 /// On-screen size (pixels) of a selected element's corner resize handles.
 const HANDLE_SIZE: f32 = 8.0;
 
 /// The toolbar's current placement tool. `Select` is the default: clicks
 /// hit-test existing overlay elements and AcroForm fields but don't create
 /// anything. `AddTextBox` is toggled on via the "Add text box" button.
+/// `PlaceSignature` is entered by clicking "Place on page" in the
+/// signature panel for the carried library entry id, and is consumed by
+/// the very next canvas click (whether it lands on empty space and places
+/// the signature, or not) — it's a one-shot mode, not a toggle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ToolMode {
     #[default]
     Select,
     AddTextBox,
+    PlaceSignature(Uuid),
 }
 
 /// Which corner of a rect a resize handle is anchored to, i.e. which edges
@@ -78,7 +88,7 @@ impl Corner {
 }
 
 /// Applies a page-space drag `delta` on handle `corner` to `rect`, moving
-/// only the edges that corner owns, then enforces [`MIN_TEXT_BOX_SIZE`] on
+/// only the edges that corner owns, then enforces [`MIN_OVERLAY_ELEMENT_SIZE`] on
 /// each axis so the opposite edge can't be dragged past (which would
 /// collapse or invert the rect). The result still needs to go through
 /// [`overlay::clamp_to_page`] (via `OverlayLayer::resize_element`) to stay
@@ -98,22 +108,37 @@ fn resize_rect_for_corner(rect: egui::Rect, corner: Corner, delta: egui::Vec2) -
         max.y += delta.y;
     }
 
-    if max.x - min.x < MIN_TEXT_BOX_SIZE.x {
+    if max.x - min.x < MIN_OVERLAY_ELEMENT_SIZE.x {
         if corner.moves_left_edge() {
-            min.x = max.x - MIN_TEXT_BOX_SIZE.x;
+            min.x = max.x - MIN_OVERLAY_ELEMENT_SIZE.x;
         } else {
-            max.x = min.x + MIN_TEXT_BOX_SIZE.x;
+            max.x = min.x + MIN_OVERLAY_ELEMENT_SIZE.x;
         }
     }
-    if max.y - min.y < MIN_TEXT_BOX_SIZE.y {
+    if max.y - min.y < MIN_OVERLAY_ELEMENT_SIZE.y {
         if corner.moves_top_edge() {
-            min.y = max.y - MIN_TEXT_BOX_SIZE.y;
+            min.y = max.y - MIN_OVERLAY_ELEMENT_SIZE.y;
         } else {
-            max.y = min.y + MIN_TEXT_BOX_SIZE.y;
+            max.y = min.y + MIN_OVERLAY_ELEMENT_SIZE.y;
         }
     }
 
     egui::Rect::from_min_max(min, max)
+}
+
+/// The default page-space rect for a newly-placed signature, anchored
+/// with its top-left corner at `origin`: width is fixed at
+/// [`DEFAULT_SIGNATURE_WIDTH`] and height follows from
+/// `image_size`'s aspect ratio, so a wide scanned signature and a short
+/// typed name both land at a sensible size on the page rather than their
+/// raw pixel dimensions (which have no relation to page points). The
+/// caller still runs the result through [`overlay::clamp_to_page`], same
+/// as a text box.
+fn default_signature_rect(origin: egui::Pos2, image_size: [usize; 2]) -> egui::Rect {
+    let [width_px, height_px] = image_size;
+    let aspect = height_px as f32 / (width_px.max(1) as f32);
+    let size = egui::vec2(DEFAULT_SIGNATURE_WIDTH, DEFAULT_SIGNATURE_WIDTH * aspect);
+    egui::Rect::from_min_size(origin, size)
 }
 
 /// The viewer's page/zoom state.
@@ -163,6 +188,15 @@ pub struct PdfUtilityApp {
     /// The current document's free-form overlay elements (text boxes, and
     /// — from Task 8 — placed signatures), covering every page.
     overlay: OverlayLayer,
+    /// GPU textures for placed `SignatureElement`s, keyed by the
+    /// element's own id (not the library entry it was placed from) — each
+    /// one is uploaded lazily in `draw_overlay` the first time it's drawn,
+    /// then reused every later frame, mirroring how
+    /// `ui::signature_panel::SignaturePanelState` caches library
+    /// thumbnails. Cleared alongside `overlay` in `open_path`, and an
+    /// entry is dropped whenever its element is deleted, so this can't
+    /// grow to outlive the elements it caches.
+    signature_textures: HashMap<Uuid, egui::TextureHandle>,
     /// The toolbar's current placement tool; see [`ToolMode`].
     tool_mode: ToolMode,
     /// The overlay element currently selected (shown with a selection
@@ -207,6 +241,7 @@ impl PdfUtilityApp {
             focused_field: None,
             field_values: HashMap::new(),
             overlay: OverlayLayer::default(),
+            signature_textures: HashMap::new(),
             tool_mode: ToolMode::default(),
             selected_element: None,
             editing_text_box: None,
@@ -239,6 +274,7 @@ impl PdfUtilityApp {
                 self.focused_field = None;
                 self.field_values.clear();
                 self.overlay = OverlayLayer::default();
+                self.signature_textures.clear();
                 self.tool_mode = ToolMode::default();
                 self.selected_element = None;
                 self.editing_text_box = None;
@@ -251,6 +287,7 @@ impl PdfUtilityApp {
                 self.focused_field = None;
                 self.field_values.clear();
                 self.overlay = OverlayLayer::default();
+                self.signature_textures.clear();
                 self.tool_mode = ToolMode::default();
                 self.selected_element = None;
                 self.editing_text_box = None;
@@ -380,6 +417,14 @@ impl PdfUtilityApp {
                     ToolMode::AddTextBox
                 };
             }
+
+            if matches!(self.tool_mode, ToolMode::PlaceSignature(_)) {
+                ui.separator();
+                ui.label("Click the page to place the signature");
+                if ui.button("Cancel").clicked() {
+                    self.tool_mode = ToolMode::Select;
+                }
+            }
         });
     }
 
@@ -464,28 +509,74 @@ impl PdfUtilityApp {
             }
             None => {
                 self.focused_field = None;
-                if self.tool_mode == ToolMode::AddTextBox {
-                    let page_size = document.page_size_points(self.viewer.current_page);
-                    let rect = overlay::clamp_to_page(
-                        egui::Rect::from_min_size(page_point, DEFAULT_TEXT_BOX_SIZE),
-                        page_size,
-                    );
-                    let id = Uuid::new_v4();
-                    self.overlay.add(OverlayElement::TextBox(TextBoxElement {
-                        id,
-                        page_index: self.viewer.current_page,
-                        rect,
-                        text: String::new(),
-                    }));
-                    self.selected_element = Some(id);
-                    self.editing_text_box = Some(id);
-                    self.request_focus_for = Some(id);
-                } else {
-                    self.selected_element = None;
-                    self.editing_text_box = None;
+                match self.tool_mode {
+                    ToolMode::AddTextBox => {
+                        let page_size = document.page_size_points(self.viewer.current_page);
+                        let rect = overlay::clamp_to_page(
+                            egui::Rect::from_min_size(page_point, DEFAULT_TEXT_BOX_SIZE),
+                            page_size,
+                        );
+                        let id = Uuid::new_v4();
+                        self.overlay.add(OverlayElement::TextBox(TextBoxElement {
+                            id,
+                            page_index: self.viewer.current_page,
+                            rect,
+                            text: String::new(),
+                        }));
+                        self.selected_element = Some(id);
+                        self.editing_text_box = Some(id);
+                        self.request_focus_for = Some(id);
+                    }
+                    ToolMode::PlaceSignature(entry_id) => {
+                        self.place_signature_from_library(entry_id, page_point);
+                        // One-shot, per `ToolMode`'s doc comment: consumed
+                        // by this click whether or not the entry was still
+                        // found (e.g. deleted from the panel after the
+                        // mode was entered but before this click landed).
+                        self.tool_mode = ToolMode::Select;
+                    }
+                    ToolMode::Select => {
+                        self.selected_element = None;
+                        self.editing_text_box = None;
+                    }
                 }
             }
         }
+    }
+
+    /// Renders library entry `entry_id` (via `signatures::render_signature_entry`)
+    /// and adds it to the overlay as a new, selected `SignatureElement`
+    /// anchored with its top-left corner at `origin` (page space), sized
+    /// via [`default_signature_rect`] and clamped to the page exactly like
+    /// a text box. A no-op (not even clearing the current selection) if
+    /// `entry_id` no longer exists in the library.
+    fn place_signature_from_library(&mut self, entry_id: Uuid, origin: egui::Pos2) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let Some(entry) = self
+            .signature_library
+            .entries
+            .iter()
+            .find(|entry| entry.id == entry_id)
+        else {
+            return;
+        };
+
+        let page_size = document.page_size_points(self.viewer.current_page);
+        let image = signatures::render_signature_entry(entry, &self.signature_dir);
+        let rect = overlay::clamp_to_page(default_signature_rect(origin, image.size), page_size);
+
+        let id = Uuid::new_v4();
+        self.overlay
+            .add(OverlayElement::Signature(SignatureElement {
+                id,
+                page_index: self.viewer.current_page,
+                rect,
+                image,
+            }));
+        self.selected_element = Some(id);
+        self.editing_text_box = None;
     }
 
     /// Returns the id of the topmost overlay element on the current page
@@ -630,14 +721,34 @@ impl PdfUtilityApp {
                     egui::Stroke::new(1.5, stroke_color),
                     egui::StrokeKind::Inside,
                 );
-                if let OverlayElement::TextBox(text_box) = element {
-                    ui.painter().text(
-                        screen_rect.left_top() + egui::vec2(4.0, 2.0),
-                        egui::Align2::LEFT_TOP,
-                        &text_box.text,
-                        egui::FontId::default(),
-                        ui.visuals().text_color(),
-                    );
+                match element {
+                    OverlayElement::TextBox(text_box) => {
+                        ui.painter().text(
+                            screen_rect.left_top() + egui::vec2(4.0, 2.0),
+                            egui::Align2::LEFT_TOP,
+                            &text_box.text,
+                            egui::FontId::default(),
+                            ui.visuals().text_color(),
+                        );
+                    }
+                    OverlayElement::Signature(signature) => {
+                        // Uploaded lazily, once per element id, then reused
+                        // every later frame — see `signature_textures`'s
+                        // doc comment.
+                        let texture = self.signature_textures.entry(id).or_insert_with(|| {
+                            ui.ctx().load_texture(
+                                format!("overlay-signature-{id}"),
+                                signature.image.clone(),
+                                egui::TextureOptions::default(),
+                            )
+                        });
+                        ui.painter().image(
+                            texture.id(),
+                            screen_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
                 }
 
                 if body_response.double_clicked() {
@@ -710,13 +821,7 @@ impl PdfUtilityApp {
         }
 
         if let Some(id) = delete_requested {
-            self.overlay.remove(id);
-            if self.selected_element == Some(id) {
-                self.selected_element = None;
-            }
-            if self.editing_text_box == Some(id) {
-                self.editing_text_box = None;
-            }
+            self.remove_overlay_element(id);
         }
 
         // Delete key removes the selected element, but only while it isn't
@@ -728,8 +833,22 @@ impl PdfUtilityApp {
             && self.editing_text_box != Some(id)
             && ui.ctx().input(|input| input.key_pressed(egui::Key::Delete))
         {
-            self.overlay.remove(id);
+            self.remove_overlay_element(id);
+        }
+    }
+
+    /// Removes overlay element `id` and any state that refers to it:
+    /// `selected_element`/`editing_text_box` if either currently points at
+    /// it, and its cached GPU texture in `signature_textures` if it has
+    /// one (a no-op for a text box, which never gets an entry there).
+    fn remove_overlay_element(&mut self, id: Uuid) {
+        self.overlay.remove(id);
+        self.signature_textures.remove(&id);
+        if self.selected_element == Some(id) {
             self.selected_element = None;
+        }
+        if self.editing_text_box == Some(id) {
+            self.editing_text_box = None;
         }
     }
 
@@ -805,14 +924,26 @@ impl eframe::App for PdfUtilityApp {
             self.menu_bar(ui);
         });
 
+        let mut place_requested: Option<Uuid> = None;
         egui::Panel::right("signature_panel")
             .default_size(220.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.signature_panel
-                        .ui(ui, &mut self.signature_library, &self.signature_dir);
+                    place_requested = self.signature_panel.ui(
+                        ui,
+                        &mut self.signature_library,
+                        &self.signature_dir,
+                    );
                 });
             });
+        if let Some(entry_id) = place_requested {
+            // Entering placement mode always starts from a clean slate,
+            // same as toggling on "Add text box" — this takes priority
+            // over whatever was selected/being edited a moment ago.
+            self.tool_mode = ToolMode::PlaceSignature(entry_id);
+            self.selected_element = None;
+            self.editing_text_box = None;
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.toolbar(ui);
@@ -928,6 +1059,75 @@ mod tests {
         assert!(rect.max.x <= page_size.x && rect.max.y <= page_size.y);
     }
 
+    /// `ToolMode::PlaceSignature` must create a real `SignatureElement`
+    /// (via `signatures::render_signature_entry`) on an empty-space click,
+    /// select it, and revert to `Select` — mirroring
+    /// `add_text_box_tool_creates_and_selects_box_on_empty_click`, but for
+    /// the one-shot signature-placement path instead of the toggled
+    /// text-box tool.
+    #[test]
+    fn place_signature_tool_creates_and_selects_signature_on_empty_click() {
+        let mut app = app_with_plain_pdf();
+        let dir = app.signature_dir.clone();
+        let entry_id = app
+            .signature_library
+            .add_typed(&dir, "Jane", "Jane Doe", "default");
+        app.tool_mode = ToolMode::PlaceSignature(entry_id);
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+
+        app.handle_canvas_click(egui::pos2(50.0, 60.0), image_rect);
+
+        assert_eq!(app.overlay.elements.len(), 1);
+        let element = &app.overlay.elements[0];
+        assert!(matches!(element, OverlayElement::Signature(_)));
+        assert_eq!(app.selected_element, Some(element.id()));
+        // One-shot: placing consumes the tool, it doesn't stay active for
+        // a second drop.
+        assert_eq!(app.tool_mode, ToolMode::Select);
+    }
+
+    /// The Review Focus requirement, exercised for a placed signature
+    /// through the real click path — mirroring
+    /// `text_box_dropped_at_page_edge_is_clamped_to_page` for the
+    /// signature-placement path.
+    #[test]
+    fn placed_signature_at_page_edge_is_clamped_to_page() {
+        let mut app = app_with_plain_pdf();
+        let dir = app.signature_dir.clone();
+        let entry_id = app
+            .signature_library
+            .add_typed(&dir, "Jane", "Jane Doe", "default");
+        app.tool_mode = ToolMode::PlaceSignature(entry_id);
+        let page_size = app.document.as_ref().unwrap().page_size_points(0);
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2000.0, 2000.0));
+
+        app.handle_canvas_click(egui::pos2(page_size.x - 1.0, page_size.y - 1.0), image_rect);
+
+        let rect = app.overlay.elements[0].rect();
+        assert!(rect.min.x >= 0.0 && rect.min.y >= 0.0);
+        assert!(rect.max.x <= page_size.x && rect.max.y <= page_size.y);
+    }
+
+    /// If the library entry named by `ToolMode::PlaceSignature` no longer
+    /// exists (e.g. deleted from the panel between entering the mode and
+    /// clicking the page), the click must be a harmless no-op — no
+    /// element created — rather than panicking, and the tool still reverts
+    /// to `Select` so the user isn't stuck in a dead placement mode.
+    #[test]
+    fn place_signature_tool_with_unknown_entry_is_a_noop_and_resets_tool_mode() {
+        let mut app = app_with_plain_pdf();
+        app.tool_mode = ToolMode::PlaceSignature(Uuid::new_v4());
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+
+        app.handle_canvas_click(egui::pos2(50.0, 60.0), image_rect);
+
+        assert!(app.overlay.elements.is_empty());
+        assert_eq!(app.tool_mode, ToolMode::Select);
+    }
+
     /// Regression test for a real invariant gap found in self-review:
     /// `selected_element`/`editing_text_box` must stay mutually exclusive
     /// with `focused_field`, or `draw_overlay`'s Delete-key handler could
@@ -984,14 +1184,14 @@ mod tests {
     }
 
     /// Dragging a corner far enough to try to collapse or invert the box
-    /// must not succeed — the opposite edge holds at `MIN_TEXT_BOX_SIZE`.
+    /// must not succeed — the opposite edge holds at `MIN_OVERLAY_ELEMENT_SIZE`.
     #[test]
     fn resize_cannot_collapse_below_minimum_size() {
         let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(50.0, 50.0));
         let resized =
             resize_rect_for_corner(rect, Corner::BottomRight, egui::vec2(-1000.0, -1000.0));
-        assert!(resized.width() >= MIN_TEXT_BOX_SIZE.x - f32::EPSILON);
-        assert!(resized.height() >= MIN_TEXT_BOX_SIZE.y - f32::EPSILON);
+        assert!(resized.width() >= MIN_OVERLAY_ELEMENT_SIZE.x - f32::EPSILON);
+        assert!(resized.height() >= MIN_OVERLAY_ELEMENT_SIZE.y - f32::EPSILON);
         assert!(resized.width() > 0.0 && resized.height() > 0.0);
     }
 }

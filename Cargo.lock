@@ -2786,8 +2786,10 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 name = "pdf_utility"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "eframe",
  "egui",
+ "epaint_default_fonts",
  "image",
  "once_cell",
  "pdfium-render",

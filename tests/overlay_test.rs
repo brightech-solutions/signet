@@ -1,4 +1,6 @@
-use pdf_utility::overlay::{OverlayElement, OverlayLayer, TextBoxElement, clamp_to_page};
+use pdf_utility::overlay::{
+    OverlayElement, OverlayLayer, SignatureElement, TextBoxElement, clamp_to_page,
+};
 use uuid::Uuid;
 
 #[test]
@@ -82,6 +84,26 @@ fn remove_deletes_element() {
     assert_eq!(layer.elements.len(), 1);
     layer.remove(id);
     assert!(layer.elements.is_empty());
+}
+
+/// The Review Focus requirement, exercised for a placed signature rather
+/// than a text box: `OverlayLayer::move_element` must clamp a
+/// `SignatureElement` exactly like a `TextBoxElement` — both go through
+/// the same `clamp_to_page` call, with no signature-specific bypass.
+#[test]
+fn placed_signature_is_clamped_like_a_text_box() {
+    let mut layer = OverlayLayer { elements: vec![] };
+    let id = Uuid::new_v4();
+    let img = egui::ColorImage::filled([40, 20], egui::Color32::TRANSPARENT);
+    layer.add(OverlayElement::Signature(SignatureElement {
+        id,
+        page_index: 0,
+        rect: egui::Rect::from_min_size(egui::pos2(590.0, 790.0), egui::vec2(40.0, 20.0)),
+        image: img,
+    }));
+    layer.move_element(id, egui::pos2(590.0, 790.0), egui::vec2(600.0, 800.0));
+    let rect = layer.elements[0].rect();
+    assert!(rect.max.x <= 600.0 && rect.max.y <= 800.0);
 }
 
 #[test]
