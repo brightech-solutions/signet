@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use pdf_utility::document::{DocumentError, PdfDocumentState};
 use pdf_utility::form_fields::{self, FieldKind};
 use pdf_utility::overlay::{self, OverlayElement, OverlayLayer, SignatureElement, TextBoxElement};
+use pdf_utility::save;
 use pdf_utility::signatures::{self, SignatureLibrary};
 use uuid::Uuid;
 
@@ -163,6 +164,13 @@ impl Default for ViewerState {
 /// Root application state.
 pub struct PdfUtilityApp {
     document: Option<PdfDocumentState>,
+    /// The path the current document was opened from, or last saved to via
+    /// "Save As" — i.e. the destination "Save" overwrites. Set on a
+    /// successful open and updated after a successful "Save As"; cleared
+    /// (along with the rest of the per-document state) when an open fails
+    /// or when there's no document at all. "Save" is disabled whenever this
+    /// is `None`, since there is then no destination path to overwrite.
+    current_file_path: Option<PathBuf>,
     viewer: ViewerState,
     /// Set when the most recent open attempt failed; cleared when the user
     /// dismisses the error modal or a later open succeeds.
@@ -234,6 +242,7 @@ impl PdfUtilityApp {
 
         let mut app = Self {
             document: None,
+            current_file_path: None,
             viewer: ViewerState::default(),
             error_message: None,
             texture: None,
@@ -267,6 +276,7 @@ impl PdfUtilityApp {
         match PdfDocumentState::open(path) {
             Ok(document) => {
                 self.document = Some(document);
+                self.current_file_path = Some(path.to_path_buf());
                 self.viewer = ViewerState::default();
                 self.error_message = None;
                 self.texture = None;
@@ -282,6 +292,7 @@ impl PdfUtilityApp {
             }
             Err(err) => {
                 self.document = None;
+                self.current_file_path = None;
                 self.texture = None;
                 self.texture_key = None;
                 self.focused_field = None;
@@ -294,6 +305,57 @@ impl PdfUtilityApp {
                 self.request_focus_for = None;
                 self.error_message = Some(error_message_for(&err));
             }
+        }
+    }
+
+    /// Writes the current document and overlay out to `path` via
+    /// [`save::save`], reporting any failure the same way an open/render
+    /// failure is reported. Returns whether the save succeeded, so callers
+    /// (`save_as`) can decide whether to adopt `path` as the new
+    /// `current_file_path`.
+    fn save_to(&mut self, path: &Path) -> bool {
+        let Some(document) = &mut self.document else {
+            return false;
+        };
+
+        match save::save(document, &self.overlay, path) {
+            Ok(()) => true,
+            Err(err) => {
+                self.error_message = Some(error_message_for(&err));
+                false
+            }
+        }
+    }
+
+    /// "Save": overwrites `current_file_path`. A no-op if there is no
+    /// current document or no path to overwrite — callers (the File menu)
+    /// are expected to disable the button in that case, but this guards
+    /// against it regardless.
+    fn save(&mut self) {
+        let Some(path) = self.current_file_path.clone() else {
+            return;
+        };
+        self.save_to(&path);
+    }
+
+    /// "Save As": always opens a native save dialog, writes to the chosen
+    /// path, and — only on success — updates `current_file_path` to it so a
+    /// subsequent "Save" overwrites the new location rather than the old
+    /// one.
+    fn save_as(&mut self) {
+        if self.document.is_none() {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name("document.pdf")
+            .save_file()
+        else {
+            return;
+        };
+
+        if self.save_to(&path) {
+            self.current_file_path = Some(path);
         }
     }
 
@@ -338,6 +400,30 @@ impl PdfUtilityApp {
                     {
                         self.open_path(&path);
                     }
+                }
+
+                ui.separator();
+
+                // Disabled (greyed out) whenever there's no destination path
+                // to overwrite — no document open, or one that was opened
+                // but never came from/was saved to a real path.
+                if ui
+                    .add_enabled(
+                        self.current_file_path.is_some(),
+                        egui::Button::new("Save"),
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.save();
+                }
+
+                if ui
+                    .add_enabled(self.document.is_some(), egui::Button::new("Save As…"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.save_as();
                 }
             });
         });
@@ -986,6 +1072,82 @@ mod tests {
 
     fn app_with_form_pdf() -> PdfUtilityApp {
         PdfUtilityApp::new(Some(PathBuf::from("tests/fixtures/sample_form.pdf")))
+    }
+
+    /// Opening a document sets `current_file_path` to it — this is what
+    /// "Save" (as opposed to "Save As") overwrites, and what gates whether
+    /// the Save menu item is enabled at all.
+    #[test]
+    fn opening_a_document_sets_current_file_path() {
+        let app = app_with_plain_pdf();
+        assert_eq!(
+            app.current_file_path,
+            Some(PathBuf::from("tests/fixtures/sample_plain.pdf"))
+        );
+    }
+
+    /// A failed open must leave `current_file_path` cleared, not pointing at
+    /// a path whose document failed to load — otherwise "Save" could be
+    /// enabled with no real document behind it.
+    #[test]
+    fn failed_open_clears_current_file_path() {
+        let mut app = app_with_plain_pdf();
+        app.open_path(Path::new("tests/fixtures/corrupt.pdf"));
+        assert!(app.current_file_path.is_none());
+        assert!(app.document.is_none());
+    }
+
+    /// `save()` (the "Save" menu item's handler) with no current document is
+    /// a harmless no-op — it must not panic even though the File menu is
+    /// expected to disable "Save" in that state.
+    #[test]
+    fn save_with_no_document_is_a_noop() {
+        let mut app = PdfUtilityApp::new(None);
+        app.save();
+        assert!(app.error_message.is_none());
+    }
+
+    /// `save()` writes the document (with its current field values and
+    /// overlay) to `current_file_path`, overwriting it in place — exercising
+    /// the real menu-wired path end-to-end, as opposed to `save_test.rs`,
+    /// which calls `pdf_utility::save::save` directly.
+    #[test]
+    fn save_overwrites_current_file_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.pdf");
+        std::fs::copy("tests/fixtures/sample_form.pdf", &path).unwrap();
+
+        let mut app = PdfUtilityApp::new(Some(path.clone()));
+        form_fields::set_field_value(
+            app.document.as_mut().unwrap(),
+            "applicant_name",
+            "Jane Doe",
+        )
+        .unwrap();
+
+        app.save();
+
+        assert!(app.error_message.is_none());
+        let reopened = PdfDocumentState::open(&path).unwrap();
+        assert_eq!(
+            form_fields::get_field_value(&reopened, "applicant_name"),
+            Some("Jane Doe".to_string())
+        );
+    }
+
+    /// `save_to` (the shared helper behind both "Save" and "Save As") writes
+    /// successfully and reports success, exercising the same path
+    /// `save_as` uses after the (untestable, native) save dialog returns a
+    /// path — this covers that it works without driving the dialog itself.
+    #[test]
+    fn save_to_writes_the_document_and_reports_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("out.pdf");
+
+        let mut app = app_with_plain_pdf();
+        assert!(app.save_to(&out_path));
+        assert!(app.error_message.is_none());
+        assert!(out_path.exists());
     }
 
     /// `handle_canvas_click` doesn't take an `egui::Ui`, so its routing
