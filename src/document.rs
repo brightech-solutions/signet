@@ -48,10 +48,32 @@ impl std::error::Error for DocumentError {}
 /// The process-wide pdfium library bindings, initialized lazily on first use.
 static PDFIUM: OnceCell<Pdfium> = OnceCell::new();
 
-/// Resolves the path to the vendored pdfium dynamic library for the host
-/// architecture, matching the layout vendored in Task 1
-/// (`vendor/pdfium/<arch>/libpdfium.dylib`).
+/// Resolves the path to the pdfium dynamic library to load.
+///
+/// When running inside a packaged `.app` bundle (Task 11), the executable
+/// lives at `PDF Utility.app/Contents/MacOS/pdf_utility` and the universal
+/// pdfium dylib is bundled alongside it at `Contents/Frameworks/libpdfium.dylib`.
+/// That bundled copy is preferred when present, since the packaged app may be
+/// launched with an arbitrary working directory (e.g. from Finder) where the
+/// dev-only `vendor/` path would not resolve.
+///
+/// Otherwise, this falls back to the layout vendored in Task 1
+/// (`vendor/pdfium/<arch>/libpdfium.dylib`, relative to the current working
+/// directory), which is what `cargo run`/`cargo test` use during development.
 fn vendored_library_path() -> PathBuf {
+    if let Ok(exe_path) = std::env::current_exe() {
+        // Contents/MacOS/pdf_utility -> Contents/Frameworks/libpdfium.dylib
+        if let Some(macos_dir) = exe_path.parent() {
+            let bundled = macos_dir
+                .join("..")
+                .join("Frameworks")
+                .join("libpdfium.dylib");
+            if bundled.is_file() {
+                return bundled;
+            }
+        }
+    }
+
     let arch_dir = if cfg!(target_arch = "aarch64") {
         "macos-arm64"
     } else {
