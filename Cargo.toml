@@ -12,4 +12,7 @@ pdfium-render = "0.9.4"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-uuid = { version = "1.28.0", features = ["v4"] }
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

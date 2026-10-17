@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 use pdf_utility::document::{DocumentError, PdfDocumentState};
 use pdf_utility::form_fields::{self, FieldKind};
 use pdf_utility::overlay::{self, OverlayElement, OverlayLayer, TextBoxElement};
+use pdf_utility::signatures::SignatureLibrary;
 use uuid::Uuid;
 
 use crate::ui::canvas;
+use crate::ui::signature_panel::SignaturePanelState;
 
 /// Smallest and largest zoom factors selectable via the zoom buttons.
 const MIN_ZOOM: f32 = 0.25;
@@ -175,12 +177,27 @@ pub struct PdfUtilityApp {
     /// `draw_overlay` can call `response.request_focus()` once rather than
     /// re-requesting focus on every frame it's drawn.
     request_focus_for: Option<Uuid>,
+    /// The personal signature library (Task 7): saved signatures, backed
+    /// by a manifest + image files under `signature_dir`. Independent of
+    /// any open document, so unlike the fields above it is never reset in
+    /// `open_path`.
+    signature_library: SignatureLibrary,
+    /// Where `signature_library` is persisted — resolved once here, at
+    /// startup, to `~/Library/Application Support/<bundle id>/signatures/`
+    /// (see `signature_library_dir`).
+    signature_dir: PathBuf,
+    /// Transient UI state (in-progress "add typed" form, thumbnail texture
+    /// cache) for the signature side panel.
+    signature_panel: SignaturePanelState,
 }
 
 impl PdfUtilityApp {
     /// Creates the app, optionally opening `initial_path` immediately (used
     /// for launch-arg / Finder double-click open).
     pub fn new(initial_path: Option<PathBuf>) -> Self {
+        let signature_dir = signature_library_dir();
+        let signature_library = SignatureLibrary::load(&signature_dir);
+
         let mut app = Self {
             document: None,
             viewer: ViewerState::default(),
@@ -194,6 +211,9 @@ impl PdfUtilityApp {
             selected_element: None,
             editing_text_box: None,
             request_focus_for: None,
+            signature_library,
+            signature_dir,
+            signature_panel: SignaturePanelState::new(),
         };
 
         if let Some(path) = initial_path {
@@ -737,6 +757,31 @@ impl PdfUtilityApp {
     }
 }
 
+/// The bundle id from `packaging/Info.plist`'s `CFBundleIdentifier`, used
+/// to namespace this app's folder under Application Support.
+const BUNDLE_ID: &str = "com.brightech.pdfutility";
+
+/// Resolves the signature library's storage directory:
+/// `~/Library/Application Support/<bundle id>/signatures/`. Computed once,
+/// here, at app startup (from [`PdfUtilityApp::new`]) rather than
+/// recomputed wherever the library is touched, so every part of the app
+/// agrees on where it lives for the life of the process — the directory
+/// itself is created lazily by `SignatureLibrary::save`/`add_image`, not
+/// here, so a fresh install with no saved signatures yet doesn't leave an
+/// empty folder behind just from opening the app.
+///
+/// Falls back to the current directory if `$HOME` isn't set, which
+/// shouldn't happen on a normal macOS login session but shouldn't be
+/// allowed to panic the app if it somehow did.
+fn signature_library_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join("Library/Application Support")
+        .join(BUNDLE_ID)
+        .join("signatures")
+}
+
 /// Maps a [`DocumentError`] to the message shown to the user. Corrupt and
 /// password-protected documents get clear, distinct, non-technical
 /// messages; the remaining variants fall back to their `Display` text.
@@ -759,6 +804,15 @@ impl eframe::App for PdfUtilityApp {
         egui::Panel::top("menu_bar_panel").show(ui, |ui| {
             self.menu_bar(ui);
         });
+
+        egui::Panel::right("signature_panel")
+            .default_size(220.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.signature_panel
+                        .ui(ui, &mut self.signature_library, &self.signature_dir);
+                });
+            });
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.toolbar(ui);

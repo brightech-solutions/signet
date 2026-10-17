@@ -8,3 +8,5 @@ pub mod annotations;
 pub mod document;
 pub mod form_fields;
 pub mod overlay;
+pub mod signature_image;
+pub mod signatures;
