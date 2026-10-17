@@ -5,9 +5,13 @@
 //! live here; the page/screen coordinate transform used to position overlays
 //! lives in [`crate::ui::canvas`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use pdf_utility::document::{DocumentError, PdfDocumentState};
+use pdf_utility::form_fields::{self, FieldKind};
+
+use crate::ui::canvas;
 
 /// Smallest and largest zoom factors selectable via the zoom buttons.
 const MIN_ZOOM: f32 = 0.25;
@@ -44,6 +48,15 @@ pub struct PdfUtilityApp {
     /// it was rendered for, so we only re-rasterize when something changed.
     texture: Option<egui::TextureHandle>,
     texture_key: Option<(usize, u32)>,
+    /// The name of the AcroForm text field currently shown as an inline
+    /// editor, if the user has clicked one. `None` means no editor is shown.
+    focused_field: Option<String>,
+    /// This session's typed values for text fields, keyed by field name.
+    /// Used to seed the inline editor's buffer so switching focus away from
+    /// a field and back doesn't lose what was typed into it, since
+    /// `form_fields` exposes no way to read a field's current value back out
+    /// of the document.
+    field_values: HashMap<String, String>,
 }
 
 impl PdfUtilityApp {
@@ -56,6 +69,8 @@ impl PdfUtilityApp {
             error_message: None,
             texture: None,
             texture_key: None,
+            focused_field: None,
+            field_values: HashMap::new(),
         };
 
         if let Some(path) = initial_path {
@@ -78,11 +93,15 @@ impl PdfUtilityApp {
                 self.error_message = None;
                 self.texture = None;
                 self.texture_key = None;
+                self.focused_field = None;
+                self.field_values.clear();
             }
             Err(err) => {
                 self.document = None;
                 self.texture = None;
                 self.texture_key = None;
+                self.focused_field = None;
+                self.field_values.clear();
                 self.error_message = Some(error_message_for(&err));
             }
         }
@@ -197,6 +216,79 @@ impl PdfUtilityApp {
         });
     }
 
+    /// Handles a click on the rendered page image at `click_pos` (absolute
+    /// screen coordinates), given the image's on-screen rect. Converts the
+    /// click to a page-space point and hit-tests it against the current
+    /// page's AcroForm fields:
+    ///
+    /// - A hit on a text field focuses it for inline editing.
+    /// - A hit on any other field kind (checkbox, radio, dropdown, ...) is a
+    ///   deliberate no-op: full support for those types isn't in scope yet,
+    ///   but clicking one must never crash the app.
+    /// - No hit leaves the current focus untouched (free-form text box
+    ///   placement for this case is Task 5's concern).
+    fn handle_canvas_click(&mut self, click_pos: egui::Pos2, image_rect: egui::Rect) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        if self.viewer.current_page >= document.page_count() {
+            return;
+        }
+
+        let zoom = self.viewer.zoom;
+        let page_point = egui::pos2(
+            (click_pos.x - image_rect.min.x) / zoom,
+            (click_pos.y - image_rect.min.y) / zoom,
+        );
+
+        let fields = form_fields::fields_on_page(document, self.viewer.current_page);
+        if let Some(field) = form_fields::hit_test(&fields, page_point)
+            && field.kind == FieldKind::Text
+        {
+            self.focused_field = Some(field.name.clone());
+            self.field_values.entry(field.name.clone()).or_default();
+        }
+        // FieldKind::Other, or no field at all: no-op, per the Review Focus
+        // requirement and Task 5's scope, respectively (see doc comment).
+    }
+
+    /// Draws the inline text editor for the currently-focused field (if any
+    /// and if it's still present on the current page), positioned over its
+    /// rect in the rendered page image. Edits are written straight through
+    /// to the document via `form_fields::set_field_value`.
+    fn draw_field_editor(&mut self, ui: &mut egui::Ui, image_rect: egui::Rect) {
+        let Some(name) = self.focused_field.clone() else {
+            return;
+        };
+
+        let field_rect = self.document.as_ref().and_then(|document| {
+            let fields = form_fields::fields_on_page(document, self.viewer.current_page);
+            fields
+                .into_iter()
+                .find(|field| field.name == name)
+                .map(|field| field.page_rect)
+        });
+
+        let Some(field_rect) = field_rect else {
+            return;
+        };
+
+        let zoom = self.viewer.zoom;
+        let scroll_offset = -image_rect.min.to_vec2();
+        let screen_rect = canvas::page_rect_to_screen(field_rect, zoom, scroll_offset);
+
+        let buffer = self.field_values.entry(name.clone()).or_default();
+        let response = ui.put(screen_rect, egui::TextEdit::singleline(buffer));
+        let changed_value = response.changed().then(|| buffer.clone());
+
+        if let Some(value) = changed_value
+            && let Some(document) = &mut self.document
+            && let Err(err) = form_fields::set_field_value(document, &name, &value)
+        {
+            self.error_message = Some(error_message_for(&err));
+        }
+    }
+
     /// Draws the error modal, if an error is currently set. Dismissible via
     /// its OK button, clicking outside it, or Escape.
     fn error_modal(&mut self, ctx: &egui::Context) {
@@ -254,7 +346,16 @@ impl eframe::App for PdfUtilityApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if let Some(texture) = &self.texture {
-                        ui.image(texture);
+                        let image_response =
+                            ui.add(egui::Image::new(texture).sense(egui::Sense::click()));
+
+                        if image_response.clicked()
+                            && let Some(click_pos) = image_response.interact_pointer_pos()
+                        {
+                            self.handle_canvas_click(click_pos, image_response.rect);
+                        }
+
+                        self.draw_field_editor(ui, image_response.rect);
                     } else if self.document.is_none() {
                         ui.label("Open a PDF via File → Open… to get started.");
                     }

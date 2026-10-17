@@ -163,4 +163,21 @@ impl PdfDocumentState {
             Err(_) => egui::Vec2::ZERO,
         }
     }
+
+    /// Crate-internal access to the underlying pdfium document.
+    ///
+    /// `PdfDocumentState`'s public API (above) deliberately exposes only
+    /// what Tasks 1-3 needed. Task 4's `form_fields` module needs direct
+    /// access to pdfium's `PdfDocument::pages()`/`PdfPage::annotations()`
+    /// form-fill API, which has no equivalent in that public surface, so
+    /// these two accessors expose the inner document crate-wide rather than
+    /// duplicating pdfium's API surface on `PdfDocumentState` itself.
+    pub(crate) fn inner(&self) -> &PdfDocument<'static> {
+        &self.document
+    }
+
+    /// See [`PdfDocumentState::inner`].
+    pub(crate) fn inner_mut(&mut self) -> &mut PdfDocument<'static> {
+        &mut self.document
+    }
 }

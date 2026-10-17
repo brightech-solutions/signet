@@ -5,3 +5,4 @@
 //! under `tests/`.
 
 pub mod document;
+pub mod form_fields;

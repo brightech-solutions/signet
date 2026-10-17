@@ -10,12 +10,26 @@
 ///
 /// `screen = page_point * zoom - scroll_offset`.
 ///
-/// Not yet called from `PdfUtilityApp` (Task 3 renders the whole page as one
-/// texture and doesn't position anything over it); later tasks' form-field
-/// and signature overlays are the first consumers.
-#[allow(dead_code)]
+/// First called from `PdfUtilityApp` as of Task 4, to position the inline
+/// text-field editor over a clicked AcroForm field; `scroll_offset` is
+/// `-image_response.rect.min.to_vec2()`, i.e. the negative of where the
+/// rendered page image's page-space origin currently sits on screen (which
+/// already accounts for the `ScrollArea`'s current scroll position).
 pub fn page_to_screen(page_point: egui::Pos2, zoom: f32, scroll_offset: egui::Vec2) -> egui::Pos2 {
     egui::pos2(page_point.x * zoom, page_point.y * zoom) - scroll_offset
+}
+
+/// Maps a rect in page space to its on-screen rect, applying
+/// [`page_to_screen`] to both corners.
+pub fn page_rect_to_screen(
+    page_rect: egui::Rect,
+    zoom: f32,
+    scroll_offset: egui::Vec2,
+) -> egui::Rect {
+    egui::Rect::from_two_pos(
+        page_to_screen(page_rect.min, zoom, scroll_offset),
+        page_to_screen(page_rect.max, zoom, scroll_offset),
+    )
 }
 
 #[cfg(test)]
@@ -30,5 +44,18 @@ mod tests {
             /*scroll_offset*/ egui::vec2(10.0, 0.0),
         );
         assert_eq!(screen, egui::pos2(190.0, 100.0));
+    }
+
+    #[test]
+    fn page_rect_to_screen_maps_both_corners() {
+        let screen = page_rect_to_screen(
+            egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(30.0, 40.0)),
+            /*zoom*/ 2.0,
+            /*scroll_offset*/ egui::vec2(5.0, 0.0),
+        );
+        assert_eq!(
+            screen,
+            egui::Rect::from_min_max(egui::pos2(15.0, 40.0), egui::pos2(55.0, 80.0))
+        );
     }
 }
