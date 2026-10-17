@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use pdf_utility::document::{DocumentError, PdfDocumentState};
 use pdf_utility::form_fields::{self, FieldKind};
+use pdf_utility::overlay::{self, OverlayElement, OverlayLayer, TextBoxElement};
+use uuid::Uuid;
 
 use crate::ui::canvas;
 
@@ -17,6 +19,100 @@ use crate::ui::canvas;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 4.0;
 const ZOOM_STEP: f32 = 0.25;
+
+/// Default size (page points) for a newly-placed free-form text box.
+const DEFAULT_TEXT_BOX_SIZE: egui::Vec2 = egui::vec2(160.0, 40.0);
+/// Smallest size (page points) a text box can be resized down to — a floor
+/// so dragging a corner past its opposite edge can't collapse or invert
+/// the box.
+const MIN_TEXT_BOX_SIZE: egui::Vec2 = egui::vec2(24.0, 16.0);
+/// On-screen size (pixels) of a selected element's corner resize handles.
+const HANDLE_SIZE: f32 = 8.0;
+
+/// The toolbar's current placement tool. `Select` is the default: clicks
+/// hit-test existing overlay elements and AcroForm fields but don't create
+/// anything. `AddTextBox` is toggled on via the "Add text box" button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ToolMode {
+    #[default]
+    Select,
+    AddTextBox,
+}
+
+/// Which corner of a rect a resize handle is anchored to, i.e. which edges
+/// move when that handle is dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Corner {
+    const ALL: [Corner; 4] = [
+        Corner::TopLeft,
+        Corner::TopRight,
+        Corner::BottomLeft,
+        Corner::BottomRight,
+    ];
+
+    fn moves_left_edge(self) -> bool {
+        matches!(self, Corner::TopLeft | Corner::BottomLeft)
+    }
+
+    fn moves_top_edge(self) -> bool {
+        matches!(self, Corner::TopLeft | Corner::TopRight)
+    }
+
+    fn point_on(self, rect: egui::Rect) -> egui::Pos2 {
+        match self {
+            Corner::TopLeft => rect.left_top(),
+            Corner::TopRight => rect.right_top(),
+            Corner::BottomLeft => rect.left_bottom(),
+            Corner::BottomRight => rect.right_bottom(),
+        }
+    }
+}
+
+/// Applies a page-space drag `delta` on handle `corner` to `rect`, moving
+/// only the edges that corner owns, then enforces [`MIN_TEXT_BOX_SIZE`] on
+/// each axis so the opposite edge can't be dragged past (which would
+/// collapse or invert the rect). The result still needs to go through
+/// [`overlay::clamp_to_page`] (via `OverlayLayer::resize_element`) to stay
+/// on the page; this function only keeps the rect itself sane.
+fn resize_rect_for_corner(rect: egui::Rect, corner: Corner, delta: egui::Vec2) -> egui::Rect {
+    let mut min = rect.min;
+    let mut max = rect.max;
+
+    if corner.moves_left_edge() {
+        min.x += delta.x;
+    } else {
+        max.x += delta.x;
+    }
+    if corner.moves_top_edge() {
+        min.y += delta.y;
+    } else {
+        max.y += delta.y;
+    }
+
+    if max.x - min.x < MIN_TEXT_BOX_SIZE.x {
+        if corner.moves_left_edge() {
+            min.x = max.x - MIN_TEXT_BOX_SIZE.x;
+        } else {
+            max.x = min.x + MIN_TEXT_BOX_SIZE.x;
+        }
+    }
+    if max.y - min.y < MIN_TEXT_BOX_SIZE.y {
+        if corner.moves_top_edge() {
+            min.y = max.y - MIN_TEXT_BOX_SIZE.y;
+        } else {
+            max.y = min.y + MIN_TEXT_BOX_SIZE.y;
+        }
+    }
+
+    egui::Rect::from_min_max(min, max)
+}
 
 /// The viewer's page/zoom state.
 ///
@@ -62,6 +158,23 @@ pub struct PdfUtilityApp {
     /// just tracks the editor's live buffer so switching focus away from a
     /// field and back doesn't lose what was typed into it.
     field_values: HashMap<String, String>,
+    /// The current document's free-form overlay elements (text boxes, and
+    /// — from Task 8 — placed signatures), covering every page.
+    overlay: OverlayLayer,
+    /// The toolbar's current placement tool; see [`ToolMode`].
+    tool_mode: ToolMode,
+    /// The overlay element currently selected (shown with a selection
+    /// outline and, while not being edited, corner resize handles), if any.
+    selected_element: Option<Uuid>,
+    /// The text box currently showing its inline `egui::TextEdit`, if any.
+    /// A subset of `selected_element`: editing implies selected, but a
+    /// selected element need not be the one being edited.
+    editing_text_box: Option<Uuid>,
+    /// Set for exactly one frame after a text box starts being edited (on
+    /// creation, or when the user re-opens an existing one), so
+    /// `draw_overlay` can call `response.request_focus()` once rather than
+    /// re-requesting focus on every frame it's drawn.
+    request_focus_for: Option<Uuid>,
 }
 
 impl PdfUtilityApp {
@@ -76,6 +189,11 @@ impl PdfUtilityApp {
             texture_key: None,
             focused_field: None,
             field_values: HashMap::new(),
+            overlay: OverlayLayer::default(),
+            tool_mode: ToolMode::default(),
+            selected_element: None,
+            editing_text_box: None,
+            request_focus_for: None,
         };
 
         if let Some(path) = initial_path {
@@ -100,6 +218,11 @@ impl PdfUtilityApp {
                 self.texture_key = None;
                 self.focused_field = None;
                 self.field_values.clear();
+                self.overlay = OverlayLayer::default();
+                self.tool_mode = ToolMode::default();
+                self.selected_element = None;
+                self.editing_text_box = None;
+                self.request_focus_for = None;
             }
             Err(err) => {
                 self.document = None;
@@ -107,6 +230,11 @@ impl PdfUtilityApp {
                 self.texture_key = None;
                 self.focused_field = None;
                 self.field_values.clear();
+                self.overlay = OverlayLayer::default();
+                self.tool_mode = ToolMode::default();
+                self.selected_element = None;
+                self.editing_text_box = None;
+                self.request_focus_for = None;
                 self.error_message = Some(error_message_for(&err));
             }
         }
@@ -218,20 +346,41 @@ impl PdfUtilityApp {
                 ui.separator();
                 ui.label(format!("{:.0} × {:.0} pt", size.x, size.y));
             }
+
+            ui.separator();
+
+            let add_text_box_active = self.tool_mode == ToolMode::AddTextBox;
+            if ui
+                .selectable_label(add_text_box_active, "Add text box")
+                .clicked()
+            {
+                self.tool_mode = if add_text_box_active {
+                    ToolMode::Select
+                } else {
+                    ToolMode::AddTextBox
+                };
+            }
         });
     }
 
     /// Handles a click on the rendered page image at `click_pos` (absolute
     /// screen coordinates), given the image's on-screen rect. Converts the
-    /// click to a page-space point and hit-tests it against the current
-    /// page's AcroForm fields:
+    /// click to a page-space point and routes it, in priority order:
     ///
-    /// - A hit on a text field focuses it for inline editing.
-    /// - A hit on any other field kind (checkbox, radio, dropdown, ...) is a
-    ///   deliberate no-op: full support for those types isn't in scope yet,
-    ///   but clicking one must never crash the app.
-    /// - No hit leaves the current focus untouched (free-form text box
-    ///   placement for this case is Task 5's concern).
+    /// 1. A hit on an existing overlay element (free-form text box, or —
+    ///    from Task 8 — a placed signature) on the current page selects it.
+    ///    This takes priority over AcroForm fields and empty-space
+    ///    placement so an element drawn on top of a field, or stacked on
+    ///    top of where a new box would otherwise be created, is what gets
+    ///    selected.
+    /// 2. A hit on an AcroForm text field focuses it for inline editing.
+    /// 3. A hit on any other field kind (checkbox, radio, dropdown, ...) is
+    ///    a deliberate no-op: full support for those types isn't in scope
+    ///    yet, but clicking one must never crash the app.
+    /// 4. No hit at all: with the "Add text box" tool active
+    ///    (`self.tool_mode`), drops a new free-form text box at the click
+    ///    and switches straight to editing it; otherwise just deselects
+    ///    whatever was selected.
     fn handle_canvas_click(&mut self, click_pos: egui::Pos2, image_rect: egui::Rect) {
         let Some(document) = &self.document else {
             return;
@@ -246,28 +395,93 @@ impl PdfUtilityApp {
             (click_pos.y - image_rect.min.y) / zoom,
         );
 
-        let fields = form_fields::fields_on_page(document, self.viewer.current_page);
-        if let Some(field) = form_fields::hit_test(&fields, page_point)
-            && field.kind == FieldKind::Text
-        {
-            let name = field.name.clone();
-            self.focused_field = Some(name.clone());
-            // Seed the editor's buffer from the field's real current value
-            // the first time it's focused in this session, rather than
-            // unconditionally defaulting to empty — a text field opened
-            // from a pre-filled template, or a document re-opened after
-            // partial filling by another tool, may already carry real
-            // content, and unconditionally starting from an empty buffer
-            // would silently discard it on the first keystroke. Once a
-            // field has an entry in `field_values` (even an empty one,
-            // e.g. because the user cleared it), that entry is left alone
-            // so in-session edits aren't clobbered by re-focusing.
-            self.field_values.entry(name).or_insert_with(|| {
-                form_fields::get_field_value(document, &field.name).unwrap_or_default()
-            });
+        if let Some(id) = self.hit_test_overlay(page_point) {
+            self.selected_element = Some(id);
+            self.focused_field = None;
+            // A plain click always lands in "selected" (outline + resize
+            // handles), never "editing" — per the doc comment, editing
+            // starts only on creation or via a double-click in
+            // `draw_overlay`. Clearing this unconditionally also means
+            // clicking a *different* element always exits whatever else
+            // was being edited.
+            self.editing_text_box = None;
+            return;
         }
-        // FieldKind::Other, or no field at all: no-op, per the Review Focus
-        // requirement and Task 5's scope, respectively (see doc comment).
+
+        let fields = form_fields::fields_on_page(document, self.viewer.current_page);
+        match form_fields::hit_test(&fields, page_point) {
+            Some(field) if field.kind == FieldKind::Text => {
+                let name = field.name.clone();
+                self.focused_field = Some(name.clone());
+                // Keep `selected_element`/`editing_text_box` mutually
+                // exclusive with `focused_field`: without this, a
+                // previously-selected overlay element would stay
+                // "selected" while this field's editor has keyboard
+                // focus, and `draw_overlay`'s Delete-key handler (which
+                // only checks `editing_text_box`, not `focused_field`)
+                // could then delete that element while the user is really
+                // just trying to delete a character in the field.
+                self.selected_element = None;
+                self.editing_text_box = None;
+                // Seed the editor's buffer from the field's real current
+                // value the first time it's focused in this session, rather
+                // than unconditionally defaulting to empty — a text field
+                // opened from a pre-filled template, or a document
+                // re-opened after partial filling by another tool, may
+                // already carry real content, and unconditionally starting
+                // from an empty buffer would silently discard it on the
+                // first keystroke. Once a field has an entry in
+                // `field_values` (even an empty one, e.g. because the user
+                // cleared it), that entry is left alone so in-session edits
+                // aren't clobbered by re-focusing.
+                self.field_values.entry(name).or_insert_with(|| {
+                    form_fields::get_field_value(document, &field.name).unwrap_or_default()
+                });
+            }
+            Some(_) => {
+                // FieldKind::Other: deliberate no-op, per the Review Focus
+                // requirement (see doc comment).
+            }
+            None => {
+                self.focused_field = None;
+                if self.tool_mode == ToolMode::AddTextBox {
+                    let page_size = document.page_size_points(self.viewer.current_page);
+                    let rect = overlay::clamp_to_page(
+                        egui::Rect::from_min_size(page_point, DEFAULT_TEXT_BOX_SIZE),
+                        page_size,
+                    );
+                    let id = Uuid::new_v4();
+                    self.overlay.add(OverlayElement::TextBox(TextBoxElement {
+                        id,
+                        page_index: self.viewer.current_page,
+                        rect,
+                        text: String::new(),
+                    }));
+                    self.selected_element = Some(id);
+                    self.editing_text_box = Some(id);
+                    self.request_focus_for = Some(id);
+                } else {
+                    self.selected_element = None;
+                    self.editing_text_box = None;
+                }
+            }
+        }
+    }
+
+    /// Returns the id of the topmost overlay element on the current page
+    /// whose rect contains `page_point`, if any. "Topmost" = last added,
+    /// matching the natural draw order in `draw_overlay` (later elements
+    /// are drawn on top of earlier ones).
+    fn hit_test_overlay(&self, page_point: egui::Pos2) -> Option<Uuid> {
+        let current_page = self.viewer.current_page;
+        self.overlay
+            .elements
+            .iter()
+            .rev()
+            .find(|element| {
+                element.page_index() == current_page && element.rect().contains(page_point)
+            })
+            .map(|element| element.id())
     }
 
     /// Draws the inline text editor for the currently-focused field (if any
@@ -309,6 +523,193 @@ impl PdfUtilityApp {
             && let Err(err) = form_fields::set_field_value(document, &name, &value)
         {
             self.error_message = Some(error_message_for(&err));
+        }
+    }
+
+    /// Draws every overlay element on the current page, and handles their
+    /// selection, drag-move, corner-handle resize, and delete.
+    ///
+    /// For each element: the selected one being actively edited (a text
+    /// box, via `editing_text_box`) is shown as a live `egui::TextEdit`;
+    /// every other element is shown as a static framed box (its text, for a
+    /// text box) that senses clicks and drags — a click selects it, a
+    /// double-click on a text box also re-opens it for editing, and a drag
+    /// moves it via `OverlayLayer::move_element`. The selected element also
+    /// gets four corner resize handles (drag one to resize via
+    /// `OverlayLayer::resize_element`) and a "×" delete button. Pressing
+    /// Delete while an element is selected (and not being edited) removes
+    /// it via `OverlayLayer::remove`.
+    ///
+    /// Both `move_element` and `resize_element` clamp the result to the
+    /// page via `overlay::clamp_to_page`, so nothing dragged here can end
+    /// up partly or fully off the page — see the Review Focus requirement
+    /// in `overlay.rs`.
+    fn draw_overlay(&mut self, ui: &mut egui::Ui, image_rect: egui::Rect) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let current_page = self.viewer.current_page;
+        if current_page >= document.page_count() {
+            return;
+        }
+
+        let zoom = self.viewer.zoom;
+        let page_size = document.page_size_points(current_page);
+        let scroll_offset = -image_rect.min.to_vec2();
+
+        // Snapshot the ids on this page before the loop: the loop below
+        // mutates `self.overlay` (move/resize), so it can't hold a live
+        // borrow of `self.overlay.elements` across iterations.
+        let ids_on_page: Vec<Uuid> = self
+            .overlay
+            .elements
+            .iter()
+            .filter(|element| element.page_index() == current_page)
+            .map(|element| element.id())
+            .collect();
+
+        let mut delete_requested: Option<Uuid> = None;
+
+        for id in ids_on_page {
+            let Some(element) = self.overlay.get(id) else {
+                continue;
+            };
+            let page_rect = element.rect();
+            let screen_rect = canvas::page_rect_to_screen(page_rect, zoom, scroll_offset);
+            let is_selected = self.selected_element == Some(id);
+            let is_editing = self.editing_text_box == Some(id);
+            let is_text_box = matches!(element, OverlayElement::TextBox(_));
+
+            if is_editing {
+                if let Some(OverlayElement::TextBox(text_box)) = self.overlay.get_mut(id) {
+                    let response = ui.put(
+                        screen_rect,
+                        egui::TextEdit::multiline(&mut text_box.text).id_salt(id),
+                    );
+                    if self.request_focus_for == Some(id) {
+                        response.request_focus();
+                        self.request_focus_for = None;
+                    }
+                    if response.lost_focus() {
+                        self.editing_text_box = None;
+                    }
+                }
+            } else {
+                let body_id = egui::Id::unique(("overlay_body", id));
+                let body_response =
+                    ui.interact(screen_rect, body_id, egui::Sense::click_and_drag());
+
+                let stroke_color = if is_selected {
+                    egui::Color32::from_rgb(0, 120, 215)
+                } else {
+                    egui::Color32::GRAY
+                };
+                ui.painter().rect_stroke(
+                    screen_rect,
+                    2.0,
+                    egui::Stroke::new(1.5, stroke_color),
+                    egui::StrokeKind::Inside,
+                );
+                if let OverlayElement::TextBox(text_box) = element {
+                    ui.painter().text(
+                        screen_rect.left_top() + egui::vec2(4.0, 2.0),
+                        egui::Align2::LEFT_TOP,
+                        &text_box.text,
+                        egui::FontId::default(),
+                        ui.visuals().text_color(),
+                    );
+                }
+
+                if body_response.double_clicked() {
+                    self.selected_element = Some(id);
+                    if is_text_box {
+                        self.editing_text_box = Some(id);
+                        self.request_focus_for = Some(id);
+                    }
+                } else if body_response.clicked() {
+                    self.selected_element = Some(id);
+                }
+
+                if body_response.dragged() {
+                    self.selected_element = Some(id);
+                    let delta_page = canvas::screen_delta_to_page(body_response.drag_delta(), zoom);
+                    self.overlay
+                        .move_element(id, page_rect.min + delta_page, page_size);
+                }
+            }
+
+            if is_selected && !is_editing {
+                for corner in Corner::ALL {
+                    // Re-read the element's current rect each handle: an
+                    // earlier handle this same frame (or the body drag
+                    // above) may already have moved/resized it.
+                    let Some(current_rect) = self.overlay.get(id).map(|element| element.rect())
+                    else {
+                        break;
+                    };
+                    let corner_screen =
+                        canvas::page_to_screen(corner.point_on(current_rect), zoom, scroll_offset);
+                    let handle_rect =
+                        egui::Rect::from_center_size(corner_screen, egui::Vec2::splat(HANDLE_SIZE));
+                    let handle_id = egui::Id::unique(("overlay_handle", id, corner));
+                    let handle_response = ui.interact(handle_rect, handle_id, egui::Sense::drag());
+                    ui.painter().rect_filled(
+                        handle_rect,
+                        1.0,
+                        egui::Color32::from_rgb(0, 120, 215),
+                    );
+
+                    if handle_response.dragged() {
+                        let delta_page =
+                            canvas::screen_delta_to_page(handle_response.drag_delta(), zoom);
+                        let new_rect = resize_rect_for_corner(current_rect, corner, delta_page);
+                        self.overlay.resize_element(id, new_rect, page_size);
+                    }
+                }
+
+                let delete_center = screen_rect.right_top() + egui::vec2(-HANDLE_SIZE, HANDLE_SIZE);
+                let delete_rect = egui::Rect::from_center_size(
+                    delete_center,
+                    egui::Vec2::splat(HANDLE_SIZE * 2.0),
+                );
+                let delete_id = egui::Id::unique(("overlay_delete", id));
+                let delete_response = ui.interact(delete_rect, delete_id, egui::Sense::click());
+                ui.painter()
+                    .rect_filled(delete_rect, 1.0, egui::Color32::from_rgb(200, 40, 40));
+                ui.painter().text(
+                    delete_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "×",
+                    egui::FontId::default(),
+                    egui::Color32::WHITE,
+                );
+                if delete_response.clicked() {
+                    delete_requested = Some(id);
+                }
+            }
+        }
+
+        if let Some(id) = delete_requested {
+            self.overlay.remove(id);
+            if self.selected_element == Some(id) {
+                self.selected_element = None;
+            }
+            if self.editing_text_box == Some(id) {
+                self.editing_text_box = None;
+            }
+        }
+
+        // Delete key removes the selected element, but only while it isn't
+        // the one currently capturing keyboard input for text editing
+        // (`handle_canvas_click`/this method keep `focused_field` and
+        // `selected_element` mutually exclusive, so this can't fire while
+        // an AcroForm field's editor has focus either).
+        if let Some(id) = self.selected_element
+            && self.editing_text_box != Some(id)
+            && ui.ctx().input(|input| input.key_pressed(egui::Key::Delete))
+        {
+            self.overlay.remove(id);
+            self.selected_element = None;
         }
     }
 
@@ -379,6 +780,7 @@ impl eframe::App for PdfUtilityApp {
                         }
 
                         self.draw_field_editor(ui, image_response.rect);
+                        self.draw_overlay(ui, image_response.rect);
                     } else if self.document.is_none() {
                         ui.label("Open a PDF via File → Open… to get started.");
                     }
@@ -386,5 +788,156 @@ impl eframe::App for PdfUtilityApp {
         });
 
         self.error_modal(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_with_plain_pdf() -> PdfUtilityApp {
+        PdfUtilityApp::new(Some(PathBuf::from("tests/fixtures/sample_plain.pdf")))
+    }
+
+    fn app_with_form_pdf() -> PdfUtilityApp {
+        PdfUtilityApp::new(Some(PathBuf::from("tests/fixtures/sample_form.pdf")))
+    }
+
+    /// `handle_canvas_click` doesn't take an `egui::Ui`, so its routing
+    /// logic (overlay hit > field hit > tool-mode-gated creation) is
+    /// directly unit-testable against a real document, without needing a
+    /// live egui frame.
+    #[test]
+    fn add_text_box_tool_creates_and_selects_box_on_empty_click() {
+        let mut app = app_with_plain_pdf();
+        app.tool_mode = ToolMode::AddTextBox;
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+
+        app.handle_canvas_click(egui::pos2(50.0, 60.0), image_rect);
+
+        assert_eq!(app.overlay.elements.len(), 1);
+        let element = &app.overlay.elements[0];
+        assert_eq!(element.page_index(), 0);
+        assert_eq!(app.selected_element, Some(element.id()));
+        assert_eq!(app.editing_text_box, Some(element.id()));
+        assert_eq!(app.request_focus_for, Some(element.id()));
+    }
+
+    #[test]
+    fn select_tool_does_not_create_a_box_on_empty_click() {
+        let mut app = app_with_plain_pdf();
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+
+        app.handle_canvas_click(egui::pos2(50.0, 60.0), image_rect);
+
+        assert!(app.overlay.elements.is_empty());
+    }
+
+    /// Clicking inside an already-placed box selects it rather than
+    /// stacking a second box underneath it, even with the "Add text box"
+    /// tool still active.
+    #[test]
+    fn clicking_an_existing_box_selects_it_without_duplicating() {
+        let mut app = app_with_plain_pdf();
+        app.tool_mode = ToolMode::AddTextBox;
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+
+        app.handle_canvas_click(egui::pos2(50.0, 60.0), image_rect);
+        let id = app.overlay.elements[0].id();
+        let rect = app.overlay.elements[0].rect();
+
+        app.handle_canvas_click(rect.center(), image_rect);
+
+        assert_eq!(app.overlay.elements.len(), 1);
+        assert_eq!(app.selected_element, Some(id));
+    }
+
+    /// The Review Focus requirement, exercised through the real click path
+    /// rather than just `clamp_to_page` directly: dropping a box with a
+    /// click right at the page's bottom-right corner must not leave any
+    /// part of it off the page.
+    #[test]
+    fn text_box_dropped_at_page_edge_is_clamped_to_page() {
+        let mut app = app_with_plain_pdf();
+        app.tool_mode = ToolMode::AddTextBox;
+        let page_size = app.document.as_ref().unwrap().page_size_points(0);
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2000.0, 2000.0));
+
+        app.handle_canvas_click(egui::pos2(page_size.x - 1.0, page_size.y - 1.0), image_rect);
+
+        let rect = app.overlay.elements[0].rect();
+        assert!(rect.min.x >= 0.0 && rect.min.y >= 0.0);
+        assert!(rect.max.x <= page_size.x && rect.max.y <= page_size.y);
+    }
+
+    /// Regression test for a real invariant gap found in self-review:
+    /// `selected_element`/`editing_text_box` must stay mutually exclusive
+    /// with `focused_field`, or `draw_overlay`'s Delete-key handler could
+    /// delete a stale "selected" overlay element while the user is really
+    /// just typing into (and might press Delete/Backspace inside) an
+    /// AcroForm field's editor.
+    #[test]
+    fn focusing_a_field_clears_overlay_selection_and_editing() {
+        let mut app = app_with_form_pdf();
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+
+        // Place and start editing a text box in the page's top-left
+        // corner, away from the fixture's AcroForm field.
+        app.tool_mode = ToolMode::AddTextBox;
+        app.handle_canvas_click(egui::pos2(5.0, 5.0), image_rect);
+        let box_id = app.overlay.elements[0].id();
+        assert_eq!(app.selected_element, Some(box_id));
+        assert_eq!(app.editing_text_box, Some(box_id));
+
+        let field_center = {
+            let document = app.document.as_ref().unwrap();
+            let fields = form_fields::fields_on_page(document, 0);
+            fields
+                .iter()
+                .find(|field| field.name == "applicant_name")
+                .unwrap()
+                .page_rect
+                .center()
+        };
+
+        app.tool_mode = ToolMode::Select;
+        app.handle_canvas_click(field_center, image_rect);
+
+        assert_eq!(app.focused_field, Some("applicant_name".to_string()));
+        assert_eq!(app.selected_element, None);
+        assert_eq!(app.editing_text_box, None);
+    }
+
+    #[test]
+    fn resize_from_bottom_right_moves_only_the_max_corner() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(50.0, 50.0));
+        let resized = resize_rect_for_corner(rect, Corner::BottomRight, egui::vec2(5.0, -3.0));
+        assert_eq!(resized.min, egui::pos2(10.0, 10.0));
+        assert_eq!(resized.max, egui::pos2(65.0, 57.0));
+    }
+
+    #[test]
+    fn resize_from_top_left_moves_only_the_min_corner() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(50.0, 50.0));
+        let resized = resize_rect_for_corner(rect, Corner::TopLeft, egui::vec2(4.0, 6.0));
+        assert_eq!(resized.min, egui::pos2(14.0, 16.0));
+        assert_eq!(resized.max, egui::pos2(60.0, 60.0));
+    }
+
+    /// Dragging a corner far enough to try to collapse or invert the box
+    /// must not succeed — the opposite edge holds at `MIN_TEXT_BOX_SIZE`.
+    #[test]
+    fn resize_cannot_collapse_below_minimum_size() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(50.0, 50.0));
+        let resized =
+            resize_rect_for_corner(rect, Corner::BottomRight, egui::vec2(-1000.0, -1000.0));
+        assert!(resized.width() >= MIN_TEXT_BOX_SIZE.x - f32::EPSILON);
+        assert!(resized.height() >= MIN_TEXT_BOX_SIZE.y - f32::EPSILON);
+        assert!(resized.width() > 0.0 && resized.height() > 0.0);
     }
 }

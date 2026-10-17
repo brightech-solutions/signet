@@ -32,6 +32,17 @@ pub fn page_rect_to_screen(
     )
 }
 
+/// Maps a screen-space delta (e.g. an `egui::Response::drag_delta()`) to
+/// the equivalent delta in page space, inverting the scale
+/// [`page_to_screen`] applies. Used by Task 5's overlay dragging/resizing
+/// (and, from Task 8, signature dragging/resizing) to turn a mouse-drag
+/// delta into a page-space move for `OverlayLayer::move_element` /
+/// `resize_element`. Scroll offset doesn't need inverting here since a
+/// *delta* between two frames is unaffected by a constant offset.
+pub fn screen_delta_to_page(screen_delta: egui::Vec2, zoom: f32) -> egui::Vec2 {
+    screen_delta / zoom
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +68,11 @@ mod tests {
             screen,
             egui::Rect::from_min_max(egui::pos2(15.0, 40.0), egui::pos2(55.0, 80.0))
         );
+    }
+
+    #[test]
+    fn screen_delta_to_page_inverts_zoom_scale() {
+        let delta = screen_delta_to_page(egui::vec2(20.0, 10.0), /*zoom*/ 2.0);
+        assert_eq!(delta, egui::vec2(10.0, 5.0));
     }
 }
