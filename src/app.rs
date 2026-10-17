@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use pdf_utility::annotations;
+use pdf_utility::apply;
 use pdf_utility::document::{DocumentError, PdfDocumentState};
 use pdf_utility::form_fields::{self, FieldKind};
 use pdf_utility::overlay::{self, OverlayElement, OverlayLayer, SignatureElement, TextBoxElement};
@@ -175,6 +177,21 @@ pub struct PdfUtilityApp {
     /// Set when the most recent open attempt failed; cleared when the user
     /// dismisses the error modal or a later open succeeds.
     error_message: Option<String>,
+    /// A non-error confirmation to show the user, dismissed the same way as
+    /// `error_message` but in its own modal (`info_modal`) so it's never
+    /// confused with a failure. Set after a successful Apply.
+    info_message: Option<String>,
+    /// `true` once Apply has successfully flattened the current document —
+    /// see `apply()`'s doc comment. There is no way to clear this back to
+    /// `false` for an open document (pdfium's flatten is one-way); it's
+    /// only ever reset by opening a different document. While `true`, every
+    /// editing interaction (field click-to-edit, the "Add text box" tool
+    /// and its placement, the signature panel's "Place on page", and all
+    /// overlay selection/move/resize/delete) is disabled — the Review
+    /// Focus requirement for this task — rather than silently accepted and
+    /// then lost, since nothing entered after a flatten can ever be baked
+    /// into the document's content again.
+    applied: bool,
     /// The texture for the currently-rendered page, plus the (page, zoom)
     /// it was rendered for, so we only re-rasterize when something changed.
     texture: Option<egui::TextureHandle>,
@@ -245,6 +262,8 @@ impl PdfUtilityApp {
             current_file_path: None,
             viewer: ViewerState::default(),
             error_message: None,
+            info_message: None,
+            applied: false,
             texture: None,
             texture_key: None,
             focused_field: None,
@@ -279,6 +298,8 @@ impl PdfUtilityApp {
                 self.current_file_path = Some(path.to_path_buf());
                 self.viewer = ViewerState::default();
                 self.error_message = None;
+                self.info_message = None;
+                self.applied = false;
                 self.texture = None;
                 self.texture_key = None;
                 self.focused_field = None;
@@ -293,6 +314,8 @@ impl PdfUtilityApp {
             Err(err) => {
                 self.document = None;
                 self.current_file_path = None;
+                self.info_message = None;
+                self.applied = false;
                 self.texture = None;
                 self.texture_key = None;
                 self.focused_field = None;
@@ -356,6 +379,70 @@ impl PdfUtilityApp {
 
         if self.save_to(&path) {
             self.current_file_path = Some(path);
+        }
+    }
+
+    /// "Apply": bakes every current overlay element onto its page as a real
+    /// annotation (the same step `save` takes, via
+    /// `annotations::write_overlay_to_annotations`, just without also
+    /// writing the file), then flattens the whole document via
+    /// `apply::flatten` so those annotations — and the AcroForm fields
+    /// already filled via `form_fields::set_field_value` — become part of
+    /// each page's content and stop being separate, editable objects.
+    ///
+    /// On success: sets `applied`, clears the now-baked-in overlay (leaving
+    /// it populated would let a later `save` re-write those same elements
+    /// as *new* annotations on top of the flattened content, duplicating
+    /// them) and every selection/editing/tool-mode field, and shows a
+    /// confirmation. A no-op if there's no current document. On failure
+    /// (either step), reports the error and leaves the document unflattened
+    /// and still editable — `applied` only ever becomes `true` once the
+    /// document has actually been flattened.
+    fn apply(&mut self) {
+        if self.document.is_none() {
+            return;
+        }
+
+        let page_count = self.document.as_ref().unwrap().page_count();
+        for page_index in 0..page_count {
+            let elements_on_page: Vec<_> = self
+                .overlay
+                .elements
+                .iter()
+                .filter(|element| element.page_index() == page_index)
+                .cloned()
+                .collect();
+
+            if elements_on_page.is_empty() {
+                continue;
+            }
+
+            let document = self.document.as_mut().unwrap();
+            if let Err(err) =
+                annotations::write_overlay_to_annotations(document, page_index, &elements_on_page)
+            {
+                self.error_message = Some(error_message_for(&err));
+                return;
+            }
+        }
+
+        let document = self.document.as_mut().unwrap();
+        match apply::flatten(document) {
+            Ok(()) => {
+                self.applied = true;
+                self.overlay = OverlayLayer::default();
+                self.signature_textures.clear();
+                self.tool_mode = ToolMode::default();
+                self.selected_element = None;
+                self.editing_text_box = None;
+                self.request_focus_for = None;
+                self.focused_field = None;
+                self.info_message =
+                    Some("This document is now locked; Save or Save As to keep it.".to_string());
+            }
+            Err(err) => {
+                self.error_message = Some(error_message_for(&err));
+            }
         }
     }
 
@@ -429,6 +516,29 @@ impl PdfUtilityApp {
         });
     }
 
+    /// Draws the "Apply" control (greyed out once the document is already
+    /// `applied`, since pdfium's flatten is one-way and there's no "apply
+    /// again") plus a persistent "Document locked" label while applied, so
+    /// the lockout is visible even when the toolbar's other editing
+    /// controls are also greyed out.
+    fn draw_apply_control(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .add_enabled(!self.applied, egui::Button::new("Apply"))
+            .on_hover_text(
+                "Flattens filled fields and overlay elements into the page, \
+                 then locks the document from further editing.",
+            )
+            .clicked()
+        {
+            self.apply();
+        }
+
+        if self.applied {
+            ui.separator();
+            ui.colored_label(egui::Color32::from_rgb(160, 120, 0), "Document locked");
+        }
+    }
+
     /// Draws the page navigation and zoom controls. Disabled (not shown)
     /// when no document is open.
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -436,6 +546,12 @@ impl PdfUtilityApp {
             return;
         };
         let page_count = document.page_count();
+        // Computed up front (rather than read from `document` inside the
+        // closure below) so the immutable borrow of `self.document` ends
+        // before the closure starts — it also calls `self.draw_apply_control`,
+        // which needs `&mut self`.
+        let current_page_size = (self.viewer.current_page < page_count)
+            .then(|| document.page_size_points(self.viewer.current_page));
 
         ui.horizontal(|ui| {
             if ui
@@ -482,10 +598,9 @@ impl PdfUtilityApp {
             // `current_page` is always kept `< page_count` by the Prev/Next
             // handlers above, but `page_size_points` returns a silent
             // `Vec2::ZERO` for an out-of-bounds index rather than a
-            // `Result`, so this bound is checked explicitly rather than
-            // trusted.
-            if self.viewer.current_page < page_count {
-                let size = document.page_size_points(self.viewer.current_page);
+            // `Result`, so this bound is checked explicitly (above, via
+            // `current_page_size`) rather than trusted.
+            if let Some(size) = current_page_size {
                 ui.separator();
                 ui.label(format!("{:.0} × {:.0} pt", size.x, size.y));
             }
@@ -494,7 +609,10 @@ impl PdfUtilityApp {
 
             let add_text_box_active = self.tool_mode == ToolMode::AddTextBox;
             if ui
-                .selectable_label(add_text_box_active, "Add text box")
+                .add_enabled(
+                    !self.applied,
+                    egui::Button::selectable(add_text_box_active, "Add text box"),
+                )
                 .clicked()
             {
                 self.tool_mode = if add_text_box_active {
@@ -504,6 +622,9 @@ impl PdfUtilityApp {
                 };
             }
 
+            // `applied` forces `tool_mode` back to `Select` as soon as it
+            // becomes true (see `apply()`), so this can only be reached
+            // pre-Apply; no `applied` guard needed here beyond that.
             if matches!(self.tool_mode, ToolMode::PlaceSignature(_)) {
                 ui.separator();
                 ui.label("Click the page to place the signature");
@@ -511,6 +632,9 @@ impl PdfUtilityApp {
                     self.tool_mode = ToolMode::Select;
                 }
             }
+
+            ui.separator();
+            self.draw_apply_control(ui);
         });
     }
 
@@ -532,7 +656,16 @@ impl PdfUtilityApp {
     ///    (`self.tool_mode`), drops a new free-form text box at the click
     ///    and switches straight to editing it; otherwise just deselects
     ///    whatever was selected.
+    ///
+    /// Once `self.applied` is `true` this is an unconditional no-op: every
+    /// one of the above (overlay selection, field focus, text box/signature
+    /// placement) is an editing interaction that the Review Focus
+    /// requirement says must be inert post-Apply, not just absent because
+    /// there happens to be nothing left to hit.
     fn handle_canvas_click(&mut self, click_pos: egui::Pos2, image_rect: egui::Rect) {
+        if self.applied {
+            return;
+        }
         let Some(document) = &self.document else {
             return;
         };
@@ -686,6 +819,14 @@ impl PdfUtilityApp {
     /// rect in the rendered page image. Edits are written straight through
     /// to the document via `form_fields::set_field_value`.
     fn draw_field_editor(&mut self, ui: &mut egui::Ui, image_rect: egui::Rect) {
+        // `apply()` always clears `focused_field` on success, so this is
+        // belt-and-suspenders defense, consistent with the explicit
+        // `applied` guards in `handle_canvas_click` and `draw_overlay`: a
+        // field editor must never be interactable post-Apply, regardless of
+        // what state happens to clear it first.
+        if self.applied {
+            return;
+        }
         let Some(name) = self.focused_field.clone() else {
             return;
         };
@@ -742,6 +883,15 @@ impl PdfUtilityApp {
     /// up partly or fully off the page — see the Review Focus requirement
     /// in `overlay.rs`.
     fn draw_overlay(&mut self, ui: &mut egui::Ui, image_rect: egui::Rect) {
+        // `apply()` clears the overlay on success, so this loop would
+        // already have nothing to iterate post-Apply; the explicit guard
+        // here is the real gate the Review Focus requirement asks for
+        // (selection/move/resize/delete must be disabled, not just
+        // incidentally absent), and also skips the Delete-key handler at
+        // the bottom of this method.
+        if self.applied {
+            return;
+        }
         let Some(document) = &self.document else {
             return;
         };
@@ -960,6 +1110,32 @@ impl PdfUtilityApp {
             self.error_message = None;
         }
     }
+
+    /// Draws the informational confirmation modal (currently only used for
+    /// the post-Apply "document is now locked" message), if one is
+    /// currently set. Dismissible the same way as `error_modal`, but kept
+    /// as a separate modal/field so a successful confirmation is never
+    /// mistaken for an error.
+    fn info_modal(&mut self, ctx: &egui::Context) {
+        let Some(message) = self.info_message.clone() else {
+            return;
+        };
+
+        let response = egui::Modal::new(egui::Id::unique("apply_info_modal")).show(ctx, |ui| {
+            ui.set_max_width(320.0);
+            ui.label(message);
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                if ui.button("OK").clicked() {
+                    ui.close();
+                }
+            });
+        });
+
+        if response.should_close() {
+            self.info_message = None;
+        }
+    }
 }
 
 /// The bundle id from `packaging/Info.plist`'s `CFBundleIdentifier`, used
@@ -1019,10 +1195,17 @@ impl eframe::App for PdfUtilityApp {
                         ui,
                         &mut self.signature_library,
                         &self.signature_dir,
+                        self.applied,
                     );
                 });
             });
-        if let Some(entry_id) = place_requested {
+        // The panel's "Place on page" button is itself disabled while
+        // `applied` (via the `locked` parameter above), so `place_requested`
+        // should never be `Some` here when applied — this guard is
+        // defense-in-depth, not the primary gate.
+        if let Some(entry_id) = place_requested
+            && !self.applied
+        {
             // Entering placement mode always starts from a clean slate,
             // same as toggling on "Add text box" — this takes priority
             // over whatever was selected/being edited a moment ago.
@@ -1059,6 +1242,7 @@ impl eframe::App for PdfUtilityApp {
         });
 
         self.error_modal(&ctx);
+        self.info_modal(&ctx);
     }
 }
 
@@ -1355,5 +1539,136 @@ mod tests {
         assert!(resized.width() >= MIN_OVERLAY_ELEMENT_SIZE.x - f32::EPSILON);
         assert!(resized.height() >= MIN_OVERLAY_ELEMENT_SIZE.y - f32::EPSILON);
         assert!(resized.width() > 0.0 && resized.height() > 0.0);
+    }
+
+    /// `apply()`'s end-to-end behavior: bakes a filled field and a placed
+    /// text box into the document, sets `applied`, clears the now-baked-in
+    /// overlay and selection/editing state, and shows the confirmation. A
+    /// subsequent save must produce a file with no interactive field left
+    /// (the field's value survives only as baked-in page content, not as
+    /// something `get_field_value` can read back from an AcroForm widget
+    /// that no longer exists).
+    #[test]
+    fn apply_flattens_locks_and_clears_overlay() {
+        let mut app = app_with_form_pdf();
+        form_fields::set_field_value(
+            app.document.as_mut().unwrap(),
+            "applicant_name",
+            "Jane Doe",
+        )
+        .unwrap();
+        app.tool_mode = ToolMode::AddTextBox;
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+        app.handle_canvas_click(egui::pos2(5.0, 5.0), image_rect);
+        assert_eq!(app.overlay.elements.len(), 1);
+
+        app.apply();
+
+        assert!(app.applied);
+        assert!(app.error_message.is_none());
+        assert!(app.info_message.is_some());
+        assert!(app.overlay.elements.is_empty());
+        assert!(app.selected_element.is_none());
+        assert!(app.editing_text_box.is_none());
+        assert!(app.focused_field.is_none());
+        assert_eq!(app.tool_mode, ToolMode::Select);
+
+        let document = app.document.as_ref().unwrap();
+        assert!(form_fields::fields_on_page(document, 0).is_empty());
+        assert!(pdf_utility::annotations::read_overlay_from_annotations(document, 0).is_empty());
+    }
+
+    /// `apply()` with no document open must be a harmless no-op, mirroring
+    /// `save_with_no_document_is_a_noop`.
+    #[test]
+    fn apply_with_no_document_is_a_noop() {
+        let mut app = PdfUtilityApp::new(None);
+        app.apply();
+        assert!(!app.applied);
+        assert!(app.error_message.is_none());
+    }
+
+    /// The Review Focus requirement: once `applied`, `handle_canvas_click`
+    /// must be an unconditional no-op — no field focus, no overlay
+    /// selection, and (with the "Add text box" tool still nominally
+    /// selected) no new element creation — rather than silently accepting
+    /// an edit that can never be baked into the now-flattened document.
+    #[test]
+    fn canvas_clicks_are_inert_after_apply() {
+        let mut app = app_with_form_pdf();
+        app.apply();
+        assert!(app.applied);
+
+        // Force the tool back on directly (bypassing the now-disabled
+        // toolbar button) to prove the lockout is enforced in the click
+        // handler itself, not just by the button being greyed out.
+        app.tool_mode = ToolMode::AddTextBox;
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+
+        app.handle_canvas_click(egui::pos2(5.0, 5.0), image_rect);
+        assert!(app.overlay.elements.is_empty());
+        assert!(app.selected_element.is_none());
+
+        let field_center = {
+            let document = app.document.as_ref().unwrap();
+            let fields = form_fields::fields_on_page(document, 0);
+            // The field itself is gone post-flatten, so there's nothing to
+            // click, but clicking where it used to be must still be inert.
+            assert!(fields.is_empty());
+            egui::pos2(100.0, 100.0)
+        };
+        app.handle_canvas_click(field_center, image_rect);
+        assert!(app.focused_field.is_none());
+    }
+
+    /// A placed signature must be just as locked out as a text box once
+    /// `applied` — exercised via `place_signature_from_library` directly,
+    /// since the panel's own "Place on page" button lives in
+    /// `ui::signature_panel` and is gated there by the `locked` parameter
+    /// `app.applied` is threaded into.
+    #[test]
+    fn placing_a_signature_is_inert_after_apply() {
+        let mut app = app_with_plain_pdf();
+        let dir = app.signature_dir.clone();
+        let entry_id = app
+            .signature_library
+            .add_typed(&dir, "Jane", "Jane Doe", "default");
+        app.apply();
+        assert!(app.applied);
+
+        app.tool_mode = ToolMode::PlaceSignature(entry_id);
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+        app.handle_canvas_click(egui::pos2(50.0, 60.0), image_rect);
+
+        assert!(app.overlay.elements.is_empty());
+    }
+
+    /// Saving after Apply must still work (the brief's manual-verification
+    /// step) and produce a file with the baked-in field value readable only
+    /// as page content, not as a live AcroForm field.
+    #[test]
+    fn save_after_apply_still_writes_the_flattened_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.pdf");
+        std::fs::copy("tests/fixtures/sample_form.pdf", &path).unwrap();
+
+        let mut app = PdfUtilityApp::new(Some(path.clone()));
+        form_fields::set_field_value(
+            app.document.as_mut().unwrap(),
+            "applicant_name",
+            "Jane Doe",
+        )
+        .unwrap();
+        app.apply();
+        assert!(app.applied);
+
+        app.save();
+
+        assert!(app.error_message.is_none());
+        let reopened = PdfDocumentState::open(&path).unwrap();
+        assert!(form_fields::fields_on_page(&reopened, 0).is_empty());
     }
 }

@@ -99,16 +99,23 @@ impl SignaturePanelState {
     /// onto the canvas on the next click) is driven by the caller
     /// (`PdfUtilityApp`), which owns the canvas and the overlay layer this
     /// panel has no access to.
+    ///
+    /// `locked` is `true` once the open document has been flattened via
+    /// Apply: library management (adding/deleting saved signatures) stays
+    /// available since it's independent of any document, but "Place on
+    /// page" is disabled — placing one onto a flattened document would
+    /// silently create an edit that Apply's lockout is supposed to prevent.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         library: &mut SignatureLibrary,
         dir: &Path,
+        locked: bool,
     ) -> Option<Uuid> {
         ui.heading("Signatures");
         ui.separator();
 
-        let place_requested = self.draw_entries(ui, library, dir);
+        let place_requested = self.draw_entries(ui, library, dir, locked);
 
         ui.separator();
         self.draw_add_image(ui, library, dir);
@@ -126,12 +133,15 @@ impl SignaturePanelState {
 
     /// Draws every saved entry as a row (thumbnail, name, "Place on page",
     /// "Delete"). Returns the id behind a clicked "Place on page" this
-    /// frame, if any.
+    /// frame, if any. "Place on page" is greyed out and inert while
+    /// `locked` is `true` (see [`Self::ui`]'s doc comment); "Delete" stays
+    /// enabled since it only touches the library, not the open document.
     fn draw_entries(
         &mut self,
         ui: &mut egui::Ui,
         library: &mut SignatureLibrary,
         dir: &Path,
+        locked: bool,
     ) -> Option<Uuid> {
         let mut to_remove: Option<Uuid> = None;
         let mut to_place: Option<Uuid> = None;
@@ -151,7 +161,10 @@ impl SignaturePanelState {
             ui.horizontal(|ui| {
                 self.draw_thumbnail(ui, library, dir, id, &source);
                 ui.label(&name);
-                if ui.small_button("Place on page").clicked() {
+                if ui
+                    .add_enabled(!locked, egui::Button::new("Place on page").small())
+                    .clicked()
+                {
                     to_place = Some(id);
                 }
                 if ui.small_button("Delete").clicked() {

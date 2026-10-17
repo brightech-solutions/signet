@@ -5,6 +5,7 @@
 //! under `tests/`.
 
 pub mod annotations;
+pub mod apply;
 pub mod document;
 pub mod form_fields;
 pub mod overlay;
