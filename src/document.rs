@@ -186,6 +186,35 @@ impl PdfDocumentState {
         }
     }
 
+    /// Makes pdfium generate any missing appearance streams for the
+    /// annotations and form widgets on page `index`, by rendering it once
+    /// into a tiny throwaway bitmap.
+    ///
+    /// pdfium only builds a widget's or `FreeText` annotation's `/AP` when
+    /// it first draws the page (the form-fill environment's page view does
+    /// it for widgets lacking one; the annotation list does it for markup
+    /// annotations), and stores the result in the annotation's dictionary.
+    /// Code that needs those streams to *exist* — saving a file other
+    /// viewers must display correctly, or `apply::flatten`, which bakes
+    /// `/AP` streams into page content and silently skips annotations that
+    /// have none — calls this first rather than relying on the page having
+    /// happened to be on screen.
+    pub fn realize_appearance_streams(&self, index: usize) -> Result<(), DocumentError> {
+        self.render_page(index, 0.05).map(|_| ())
+    }
+
+    /// Replaces the open document with one loaded from `bytes` (a complete
+    /// PDF file image), e.g. after a structural edit made outside pdfium.
+    /// On failure the current document is left untouched.
+    pub(crate) fn replace_with_bytes(&mut self, bytes: Vec<u8>) -> Result<(), DocumentError> {
+        let pdfium = pdfium_instance()?;
+        let document = pdfium
+            .load_pdf_from_byte_vec(bytes, None)
+            .map_err(map_load_error)?;
+        self.document = document;
+        Ok(())
+    }
+
     /// Crate-internal access to the underlying pdfium document.
     ///
     /// `PdfDocumentState`'s public API (above) deliberately exposes only

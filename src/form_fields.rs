@@ -138,11 +138,60 @@ pub fn get_field_value(doc: &PdfDocumentState, name: &str) -> Option<String> {
 }
 
 /// Sets the value of the text field named `name`, searching every page of
-/// `doc`.
+/// `doc`, and makes the new value actually *visible*: on the page as
+/// rendered here, in a saved file, and to anything that later bakes the
+/// field's appearance into page content (`apply::flatten`).
+///
+/// Writing `/V` alone (all pdfium-render's `PdfFormTextField::set_value`
+/// does) isn't enough: pdfium draws a widget from its appearance stream
+/// (`/AP`), which it generates once — the first time the page is drawn,
+/// i.e. right after the document opens — and then keeps, so it would go on
+/// showing the old value indefinitely. So after writing `/V` this:
+///
+/// 1. serializes the document and drops the widget's stale `/AP` via
+///    [`crate::pdf_structure::invalidate_field_appearances`] (an
+///    incremental update; pdfium-render has no API to do this in place);
+/// 2. reloads the document from those bytes; and
+/// 3. renders each affected page once, so pdfium regenerates the widget's
+///    appearance from the new value immediately and keeps it in the
+///    document — present for every later render and save.
+///
+/// That's a whole-document round trip, so callers should invoke this when
+/// an edit is committed (e.g. the field editor losing focus), not on every
+/// keystroke.
 ///
 /// Returns `DocumentError::Pdfium` if no field with that name exists, or if
-/// it exists but isn't a text field.
+/// it exists but isn't a text field, or if the appearance couldn't be
+/// refreshed (in which case `/V` itself has still been updated).
 pub fn set_field_value(
+    doc: &mut PdfDocumentState,
+    name: &str,
+    value: &str,
+) -> Result<(), DocumentError> {
+    write_field_value(doc, name, value)?;
+
+    let bytes = doc
+        .inner()
+        .save_to_bytes()
+        .map_err(|err| DocumentError::Pdfium(err.to_string()))?;
+
+    let Some(edit) = crate::pdf_structure::invalidate_field_appearances(bytes, name)? else {
+        return Err(DocumentError::Pdfium(format!(
+            "the value of field '{name}' was set, but its on-page appearance couldn't be updated"
+        )));
+    };
+
+    doc.replace_with_bytes(edit.bytes)?;
+    for page_index in edit.page_indices {
+        doc.realize_appearance_streams(page_index)?;
+    }
+
+    Ok(())
+}
+
+/// Writes `/V` for the text field named `name` via pdfium-render, without
+/// touching its appearance. See [`set_field_value`].
+fn write_field_value(
     doc: &mut PdfDocumentState,
     name: &str,
     value: &str,

@@ -210,6 +210,10 @@ pub struct PdfUtilityApp {
     /// just tracks the editor's live buffer so switching focus away from a
     /// field and back doesn't lose what was typed into it.
     field_values: HashMap<String, String>,
+    /// Set for exactly one frame after a field is focused by a click, so
+    /// `draw_field_editor` gives its `TextEdit` keyboard focus once (and a
+    /// later focus loss reliably commits the edit).
+    request_field_focus: bool,
     /// The current document's free-form overlay elements (text boxes, and
     /// — from Task 8 — placed signatures), covering every page.
     overlay: OverlayLayer,
@@ -268,6 +272,7 @@ impl PdfUtilityApp {
             texture_key: None,
             focused_field: None,
             field_values: HashMap::new(),
+            request_field_focus: false,
             overlay: OverlayLayer::default(),
             signature_textures: HashMap::new(),
             tool_mode: ToolMode::default(),
@@ -337,6 +342,9 @@ impl PdfUtilityApp {
     /// (`save_as`) can decide whether to adopt `path` as the new
     /// `current_file_path`.
     fn save_to(&mut self, path: &Path) -> bool {
+        // An edit still sitting in the field editor's buffer is part of
+        // what the user expects to be saved.
+        self.commit_field_edit();
         let Some(document) = &mut self.document else {
             return false;
         };
@@ -402,6 +410,8 @@ impl PdfUtilityApp {
         if self.document.is_none() {
             return;
         }
+        // Bake the field editor's pending value too, not the stale one.
+        self.commit_field_edit();
 
         let page_count = self.document.as_ref().unwrap().page_count();
         for page_index in 0..page_count {
@@ -666,6 +676,11 @@ impl PdfUtilityApp {
         if self.applied {
             return;
         }
+        // Whatever this click lands on, an in-progress field edit is
+        // finished by it — commit it before focus can move elsewhere (the
+        // old field's editor won't be drawn again to notice its own focus
+        // loss once `focused_field` points somewhere else).
+        self.commit_field_edit();
         let Some(document) = &self.document else {
             return;
         };
@@ -697,6 +712,7 @@ impl PdfUtilityApp {
             Some(field) if field.kind == FieldKind::Text => {
                 let name = field.name.clone();
                 self.focused_field = Some(name.clone());
+                self.request_field_focus = true;
                 // Keep `selected_element`/`editing_text_box` mutually
                 // exclusive with `focused_field`: without this, a
                 // previously-selected overlay element would stay
@@ -853,15 +869,61 @@ impl PdfUtilityApp {
         // already exists by the time we get here; `.or_default()` is just a
         // defensive fallback, not the normal seeding path.
         let buffer = self.field_values.entry(name.clone()).or_default();
-        let response = ui.put(screen_rect, egui::TextEdit::singleline(buffer));
-        let changed_value = response.changed().then(|| buffer.clone());
+        let response = ui.put(
+            screen_rect,
+            egui::TextEdit::singleline(buffer).id_salt(("field_editor", &name)),
+        );
+        if self.request_field_focus {
+            response.request_focus();
+            self.request_field_focus = false;
+        }
 
-        if let Some(value) = changed_value
-            && let Some(document) = &mut self.document
-            && let Err(err) = form_fields::set_field_value(document, &name, &value)
-        {
+        // Typing only edits the buffer; the value is written to the
+        // document when the edit is committed (here on focus loss —
+        // Enter, Tab, Escape or clicking elsewhere — and also before any
+        // click is routed, Save, Apply, or Open; see `commit_field_edit`).
+        // Committing is a whole-document round trip (it regenerates the
+        // field's on-page appearance), too heavy to repeat per keystroke.
+        if response.lost_focus() {
+            self.commit_field_edit();
+            self.focused_field = None;
+        }
+    }
+
+    /// Writes the focused field's editor buffer to the document, if it
+    /// differs from the field's current value, via
+    /// `form_fields::set_field_value` (which also regenerates the field's
+    /// on-page appearance) and drops the cached page texture so the canvas
+    /// re-renders with the new value. A no-op if no field is focused.
+    fn commit_field_edit(&mut self) {
+        let Some(name) = self.focused_field.clone() else {
+            return;
+        };
+        let Some(buffer) = self.field_values.get(&name).cloned() else {
+            return;
+        };
+        let Some(document) = &mut self.document else {
+            return;
+        };
+        if form_fields::get_field_value(document, &name).unwrap_or_default() == buffer {
+            return;
+        }
+
+        let result = form_fields::set_field_value(document, &name, &buffer);
+        // Invalidate even on failure: `set_field_value` may already have
+        // changed `/V` before the appearance refresh failed.
+        self.invalidate_page_texture();
+        if let Err(err) = result {
             self.error_message = Some(error_message_for(&err));
         }
+    }
+
+    /// Forces `ensure_texture` to re-render the current page on the next
+    /// frame. Needed after anything that changes the document's rendered
+    /// content without changing the (page, zoom) cache key — a committed
+    /// field edit, or Apply.
+    fn invalidate_page_texture(&mut self) {
+        self.texture_key = None;
     }
 
     /// Draws every overlay element on the current page, and handles their
@@ -1256,6 +1318,85 @@ mod tests {
 
     fn app_with_form_pdf() -> PdfUtilityApp {
         PdfUtilityApp::new(Some(PathBuf::from("tests/fixtures/sample_form.pdf")))
+    }
+
+    /// Counts opaque, darker-than-mid-grey pixels of page `page_index`
+    /// (rendered at zoom 1) inside `page_rect` — i.e. whether something is
+    /// actually drawn there, not whether some object merely exists.
+    fn ink_in(document: &PdfDocumentState, page_index: usize, page_rect: egui::Rect) -> usize {
+        let image = document.render_page(page_index, 1.0).unwrap();
+        let [width, height] = image.size;
+        let mut count = 0;
+        for y in (page_rect.min.y.max(0.0) as usize)..(page_rect.max.y as usize).min(height) {
+            for x in (page_rect.min.x.max(0.0) as usize)..(page_rect.max.x as usize).min(width) {
+                let p = image.pixels[y * width + x];
+                if p.a() > 128 && (p.r() as u32 + p.g() as u32 + p.b() as u32) < 384 {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    fn applicant_field_rect(app: &PdfUtilityApp) -> egui::Rect {
+        form_fields::fields_on_page(app.document.as_ref().unwrap(), 0)
+            .into_iter()
+            .find(|field| field.name == "applicant_name")
+            .unwrap()
+            .page_rect
+    }
+
+    fn big_image_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0))
+    }
+
+    /// Final review Critical #3, app side: a committed field edit must
+    /// reach the document *visibly* and drop the cached page texture, so
+    /// the canvas re-renders instead of showing the pre-edit page.
+    #[test]
+    fn committing_a_field_edit_renders_the_value_and_invalidates_the_page_texture() {
+        let mut app = app_with_form_pdf();
+        let ctx = egui::Context::default();
+        app.ensure_texture(&ctx);
+        assert!(app.texture_key.is_some());
+
+        let rect = applicant_field_rect(&app);
+        app.handle_canvas_click(rect.center(), big_image_rect());
+        assert_eq!(app.focused_field.as_deref(), Some("applicant_name"));
+        app.field_values
+            .insert("applicant_name".to_string(), "Jane Doe".to_string());
+
+        app.commit_field_edit();
+
+        assert!(app.error_message.is_none(), "{:?}", app.error_message);
+        assert!(app.texture_key.is_none(), "stale page texture kept");
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(
+            form_fields::get_field_value(document, "applicant_name"),
+            Some("Jane Doe".to_string())
+        );
+        assert!(ink_in(document, 0, rect) > 50);
+    }
+
+    /// Clicking away from a field being edited (here: onto empty page
+    /// space) commits what was typed, rather than dropping it.
+    #[test]
+    fn clicking_away_from_a_field_commits_its_edit() {
+        let mut app = app_with_form_pdf();
+        let rect = applicant_field_rect(&app);
+        app.handle_canvas_click(rect.center(), big_image_rect());
+        app.field_values
+            .insert("applicant_name".to_string(), "Jane Doe".to_string());
+
+        app.handle_canvas_click(egui::pos2(5.0, 5.0), big_image_rect());
+
+        assert_eq!(app.focused_field, None);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(
+            form_fields::get_field_value(document, "applicant_name"),
+            Some("Jane Doe".to_string())
+        );
+        assert!(ink_in(document, 0, rect) > 50);
     }
 
     /// Opening a document sets `current_file_path` to it — this is what

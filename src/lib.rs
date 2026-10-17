@@ -9,6 +9,7 @@ pub mod apply;
 pub mod document;
 pub mod form_fields;
 pub mod overlay;
+pub mod pdf_structure;
 pub mod save;
 pub mod signature_image;
 pub mod signatures;
