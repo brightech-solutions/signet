@@ -16,7 +16,8 @@
 //! elements still floating as annotations rather than flattened into page
 //! content) opens correctly in any PDF viewer, not just this app.
 
-use std::path::Path;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
 use crate::document::{DocumentError, PdfDocumentState};
 use crate::overlay::OverlayLayer;
@@ -52,9 +53,63 @@ pub fn save(
         write_overlay_to_annotations(doc, page_index, &elements_on_page)?;
     }
 
-    doc.inner()
-        .save_to_file(path)
-        .map_err(|err| DocumentError::Pdfium(err.to_string()))
+    write_document_atomically(doc, path)
+}
+
+/// Writes `doc` to `path` without ever truncating `path` itself mid-write.
+///
+/// pdfium loads documents lazily: the [`PdfDocumentState`] keeps reading
+/// page objects from the file it was opened from for as long as it's open
+/// (see `Pdfium::load_pdf_from_file`, which hands pdfium a live `File`).
+/// pdfium-render's own `save_to_file` does `File::create(path)` first,
+/// which — when `path` is that same open file, i.e. a plain "Save" —
+/// truncates it to zero bytes *before* pdfium has read the objects it's
+/// about to write out, destroying every page it hadn't touched yet.
+///
+/// Instead, the document is written to a fresh temporary file in the same
+/// directory as `path` and only then `rename`d over it. `rename` within one
+/// directory is atomic on macOS/APFS, and the still-open source `File`
+/// keeps referring to the original (now unlinked) inode, so pdfium's lazy
+/// reads keep working against the original bytes for the rest of the
+/// session. On any failure the temporary file is removed and `path` is
+/// left exactly as it was.
+fn write_document_atomically(doc: &PdfDocumentState, path: &Path) -> Result<(), DocumentError> {
+    // Write next to the real file, not next to a symlink pointing at it,
+    // so the final rename replaces the file's contents rather than the
+    // link — and so temp + target are guaranteed to be on one filesystem.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let file_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document.pdf".to_string());
+    let temp_path = dir.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+
+    let result = (|| {
+        let mut file = File::create(&temp_path).map_err(DocumentError::Io)?;
+        doc.inner()
+            .save_to_writer(&mut file)
+            .map_err(|err| DocumentError::Pdfium(err.to_string()))?;
+        file.sync_all().map_err(DocumentError::Io)?;
+
+        // Keep an existing file's permissions (e.g. a 0600 private
+        // document) rather than silently resetting them to the umask
+        // default a brand-new file gets.
+        if let Ok(metadata) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&temp_path, metadata.permissions())
+                .map_err(DocumentError::Io)?;
+        }
+
+        std::fs::rename(&temp_path, &target).map_err(DocumentError::Io)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 #[cfg(test)]
