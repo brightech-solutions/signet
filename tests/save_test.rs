@@ -2,8 +2,8 @@ mod common;
 
 use std::path::Path;
 
-use common::{ink_in, multipage_marker_rect};
-use pdf_utility::annotations::read_overlay_from_annotations;
+use common::{app_annotation_count_in_file, ink_in, multipage_marker_rect};
+use pdf_utility::annotations::{read_overlay_from_annotations, take_overlay_from_document};
 use pdf_utility::document::PdfDocumentState;
 use pdf_utility::form_fields::{fields_on_page, get_field_value, set_field_value};
 use pdf_utility::overlay::{OverlayElement, OverlayLayer, TextBoxElement};
@@ -105,4 +105,122 @@ fn save_as_leaves_the_source_file_untouched() {
     assert_eq!(std::fs::read(&source).unwrap(), before);
     let reopened = PdfDocumentState::open(&dest).unwrap();
     assert!(ink_in(&reopened, 11, multipage_marker_rect(12)) >= 1500);
+}
+
+fn text_box(rect: egui::Rect, text: &str) -> OverlayElement {
+    OverlayElement::TextBox(TextBoxElement {
+        id: Uuid::new_v4(),
+        page_index: 0,
+        rect,
+        text: text.into(),
+    })
+}
+
+const NOTE_RECT: egui::Rect = egui::Rect {
+    min: egui::pos2(100.0, 300.0),
+    max: egui::pos2(300.0, 340.0),
+};
+
+/// Final review Critical #4 (a): a saved text box comes back on reopen as
+/// a real, editable `OverlayElement` — and is taken off the page itself,
+/// so it isn't also drawn underneath the live element as static pixels.
+#[test]
+fn saved_text_box_reopens_as_an_editable_overlay_element() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("out.pdf");
+    let mut doc = PdfDocumentState::open(Path::new("tests/fixtures/sample_plain.pdf")).unwrap();
+    let mut overlay = OverlayLayer::default();
+    overlay.add(text_box(NOTE_RECT, "HELLO WORLD"));
+    save(&mut doc, &overlay, &path).unwrap();
+    drop(doc);
+
+    let mut reopened = PdfDocumentState::open(&path).unwrap();
+    assert!(ink_in(&reopened, 0, NOTE_RECT) > 50, "saved file should show the text box");
+
+    let overlay = take_overlay_from_document(&mut reopened).unwrap();
+    assert_eq!(overlay.elements.len(), 1);
+    match &overlay.elements[0] {
+        OverlayElement::TextBox(tb) => {
+            assert_eq!(tb.text, "HELLO WORLD");
+            assert!((tb.rect.min - NOTE_RECT.min).length() < 0.5);
+            assert!((tb.rect.size() - NOTE_RECT.size()).length() < 0.5);
+        }
+        other => panic!("expected a text box, got {other:?}"),
+    }
+    assert_eq!(
+        ink_in(&reopened, 0, NOTE_RECT),
+        0,
+        "text box is still drawn into the page under the live overlay element"
+    );
+    assert!(read_overlay_from_annotations(&reopened, 0).is_empty());
+}
+
+/// Final review Critical #4 (b): saving the same document twice in one
+/// session leaves exactly one annotation per element in the file.
+#[test]
+fn saving_twice_writes_exactly_one_annotation_per_element() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("out.pdf");
+    std::fs::copy("tests/fixtures/sample_plain.pdf", &path).unwrap();
+    let mut doc = PdfDocumentState::open(&path).unwrap();
+    let mut overlay = OverlayLayer::default();
+    overlay.add(text_box(NOTE_RECT, "HELLO WORLD"));
+
+    save(&mut doc, &overlay, &path).unwrap();
+    save(&mut doc, &overlay, &path).unwrap();
+
+    assert_eq!(app_annotation_count_in_file(&path, 1), 1);
+    // ...and the in-memory page doesn't keep a static copy drawn under the
+    // live overlay either.
+    assert!(read_overlay_from_annotations(&doc, 0).is_empty());
+    assert_eq!(ink_in(&doc, 0, NOTE_RECT), 0);
+}
+
+/// Final review Critical #4 (b), across sessions: reopen a saved file,
+/// take its overlay, save again — still exactly one annotation.
+#[test]
+fn reopening_and_resaving_does_not_duplicate_annotations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("out.pdf");
+    let mut doc = PdfDocumentState::open(Path::new("tests/fixtures/sample_plain.pdf")).unwrap();
+    let mut overlay = OverlayLayer::default();
+    overlay.add(text_box(NOTE_RECT, "HELLO WORLD"));
+    save(&mut doc, &overlay, &path).unwrap();
+    drop(doc);
+
+    let mut reopened = PdfDocumentState::open(&path).unwrap();
+    let overlay = take_overlay_from_document(&mut reopened).unwrap();
+    save(&mut reopened, &overlay, &path).unwrap();
+    drop(reopened);
+
+    assert_eq!(app_annotation_count_in_file(&path, 1), 1);
+}
+
+/// Final review Critical #4 (c): add, save, move, save again, reopen —
+/// only the new position exists; no ghost at the old one.
+#[test]
+fn moving_an_element_between_saves_leaves_no_ghost() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("out.pdf");
+    std::fs::copy("tests/fixtures/sample_plain.pdf", &path).unwrap();
+    let mut doc = PdfDocumentState::open(&path).unwrap();
+    let page_size = doc.page_size_points(0);
+    let mut overlay = OverlayLayer::default();
+    overlay.add(text_box(NOTE_RECT, "HELLO WORLD"));
+    save(&mut doc, &overlay, &path).unwrap();
+
+    let id = overlay.elements[0].id();
+    let new_origin = egui::pos2(100.0, 500.0);
+    overlay.move_element(id, new_origin, page_size);
+    save(&mut doc, &overlay, &path).unwrap();
+    drop(doc);
+
+    assert_eq!(app_annotation_count_in_file(&path, 1), 1);
+    let mut reopened = PdfDocumentState::open(&path).unwrap();
+    assert_eq!(ink_in(&reopened, 0, NOTE_RECT), 0, "ghost left at the old position");
+    let moved_rect = egui::Rect::from_min_size(new_origin, NOTE_RECT.size());
+    assert!(ink_in(&reopened, 0, moved_rect) > 50, "nothing at the new position");
+    let overlay = take_overlay_from_document(&mut reopened).unwrap();
+    assert_eq!(overlay.elements.len(), 1);
+    assert!((overlay.elements[0].rect().min - new_origin).length() < 0.5);
 }

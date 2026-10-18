@@ -3,8 +3,11 @@ mod common;
 use std::path::Path;
 
 use common::ink_in;
-use pdf_utility::annotations::{read_overlay_from_annotations, write_overlay_to_annotations};
+use pdf_utility::annotations::{
+    read_overlay_from_annotations, remove_overlay_annotations, write_overlay_to_annotations,
+};
 use pdf_utility::document::PdfDocumentState;
+use pdf_utility::form_fields::fields_on_page;
 use pdf_utility::overlay::{OverlayElement, SignatureElement, TextBoxElement};
 use pdf_utility::signatures::{SignatureEntry, SignatureSource, render_signature_entry};
 use uuid::Uuid;
@@ -107,18 +110,15 @@ fn saved_multiline_text_box_renders_each_line_and_no_border() {
 
     let mut doc = PdfDocumentState::open(Path::new("tests/fixtures/sample_plain.pdf")).unwrap();
     let text = "FIRST LINE\nSECOND LINE";
-    write_overlay_to_annotations(
-        &mut doc,
-        0,
-        &[OverlayElement::TextBox(TextBoxElement {
+    let overlay = pdf_utility::overlay::OverlayLayer {
+        elements: vec![OverlayElement::TextBox(TextBoxElement {
             id: Uuid::new_v4(),
             page_index: 0,
             rect,
             text: text.into(),
         })],
-    )
-    .unwrap();
-    pdf_utility::save::save(&mut doc, &Default::default(), &path).unwrap();
+    };
+    pdf_utility::save::save(&mut doc, &overlay, &path).unwrap();
     drop(doc);
 
     let reopened = PdfDocumentState::open(&path).unwrap();
@@ -189,6 +189,52 @@ fn long_text_box_line_wraps_within_its_rect() {
         let ink = ink_in(&doc, 0, band);
         assert!(ink > 40, "wrapped line {line} has only {ink} ink pixels");
     }
+}
+
+/// `remove_overlay_annotations` deletes every app-written annotation from
+/// the page — so it is no longer drawn — while leaving the page's own
+/// annotations (here: the fixture's AcroForm widget) untouched.
+#[test]
+fn remove_overlay_annotations_deletes_only_app_annotations() {
+    let mut doc = PdfDocumentState::open(Path::new("tests/fixtures/sample_form.pdf")).unwrap();
+    let text_rect = egui::Rect::from_min_size(egui::pos2(100.0, 300.0), egui::vec2(200.0, 40.0));
+    let signature_rect =
+        egui::Rect::from_min_size(egui::pos2(100.0, 400.0), egui::vec2(100.0, 40.0));
+    write_overlay_to_annotations(
+        &mut doc,
+        0,
+        &[
+            OverlayElement::TextBox(TextBoxElement {
+                id: Uuid::new_v4(),
+                page_index: 0,
+                rect: text_rect,
+                text: "HELLO WORLD".into(),
+            }),
+            OverlayElement::Signature(SignatureElement {
+                id: Uuid::new_v4(),
+                page_index: 0,
+                rect: signature_rect,
+                image: egui::ColorImage::filled([50, 20], egui::Color32::from_rgb(10, 10, 60)),
+            }),
+        ],
+    )
+    .unwrap();
+    assert!(ink_in(&doc, 0, text_rect) > 50);
+    assert!(ink_in(&doc, 0, signature_rect) > 1000);
+
+    let removed = remove_overlay_annotations(&mut doc, 0).unwrap();
+
+    assert_eq!(removed, 2);
+    assert!(read_overlay_from_annotations(&doc, 0).is_empty());
+    assert_eq!(ink_in(&doc, 0, text_rect), 0, "text box still drawn");
+    assert_eq!(ink_in(&doc, 0, signature_rect), 0, "signature still drawn");
+    assert!(
+        fields_on_page(&doc, 0).iter().any(|field| field.name == "applicant_name"),
+        "the form's own widget was removed too"
+    );
+    // Nothing left to remove; out-of-range page is an error.
+    assert_eq!(remove_overlay_annotations(&mut doc, 0).unwrap(), 0);
+    assert!(remove_overlay_annotations(&mut doc, 99).is_err());
 }
 
 /// An empty text box survives a save round trip as an (empty) text box

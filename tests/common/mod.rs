@@ -38,6 +38,35 @@ pub fn ink_in(doc: &PdfDocumentState, page_index: usize, page_rect: egui::Rect) 
     ink_pixels(&image, page_rect, 1.0)
 }
 
+/// Counts the annotations in the saved file at `path` on page `page_number`
+/// (1-based) whose `/T` is the app's marker — read straight from the file's
+/// bytes with lopdf, independently of pdfium, so it counts what's really
+/// in the file's `/Annots` array.
+pub fn app_annotation_count_in_file(path: &std::path::Path, page_number: u32) -> usize {
+    let doc = lopdf::Document::load(path).expect("saved file parses");
+    let page_id = *doc.get_pages().get(&page_number).expect("page exists");
+    let page = doc.get_dictionary(page_id).unwrap();
+    let Ok(annots) = page.get(b"Annots") else {
+        return 0;
+    };
+    let (_, annots) = doc.dereference(annots).unwrap();
+    annots
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            let dict = match entry {
+                lopdf::Object::Reference(id) => doc.get_dictionary(*id).ok(),
+                other => other.as_dict().ok(),
+            };
+            dict.and_then(|dict| dict.get(b"T").ok())
+                .and_then(|title| lopdf::decode_text_string(title).ok())
+                .as_deref()
+                == Some(pdf_utility::annotations::APP_MARKER)
+        })
+        .count()
+}
+
 /// The solid 40x40pt marker square drawn on page `page_number` (1-based) of
 /// `tests/fixtures/sample_multipage.pdf`, in page space.
 pub fn multipage_marker_rect(page_number: usize) -> egui::Rect {

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use pdf_utility::annotations;
 use pdf_utility::apply;
 use pdf_utility::document::{DocumentError, PdfDocumentState};
 use pdf_utility::form_fields::{self, FieldKind};
@@ -296,8 +297,15 @@ impl PdfUtilityApp {
     /// previous error. On failure, leaves no document open and records a
     /// user-facing error message.
     fn open_path(&mut self, path: &Path) {
-        match PdfDocumentState::open(path) {
-            Ok(document) => {
+        // Text boxes / signatures saved by an earlier session come back as
+        // live, editable overlay elements (and are taken off the page
+        // itself, so they aren't also drawn underneath as static pixels).
+        let opened = PdfDocumentState::open(path).and_then(|mut document| {
+            let overlay = annotations::take_overlay_from_document(&mut document)?;
+            Ok((document, overlay))
+        });
+        match opened {
+            Ok((document, overlay)) => {
                 self.document = Some(document);
                 self.current_file_path = Some(path.to_path_buf());
                 self.viewer = ViewerState::default();
@@ -308,7 +316,7 @@ impl PdfUtilityApp {
                 self.texture_key = None;
                 self.focused_field = None;
                 self.field_values.clear();
-                self.overlay = OverlayLayer::default();
+                self.overlay = overlay;
                 self.signature_textures.clear();
                 self.tool_mode = ToolMode::default();
                 self.selected_element = None;
@@ -1436,6 +1444,48 @@ mod tests {
         assert_eq!(
             form_fields::get_field_value(&reopened, "applicant_name"),
             Some("Jane Doe".to_string())
+        );
+    }
+
+    /// Final review Critical #4, app side: a text box saved by one session
+    /// is a live, editable overlay element after File → Open in the next
+    /// (not just pixels baked into the page), and saving again in place
+    /// doesn't duplicate it.
+    #[test]
+    fn open_path_restores_saved_overlay_elements_as_editable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.pdf");
+        std::fs::copy("tests/fixtures/sample_plain.pdf", &path).unwrap();
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 300.0), egui::vec2(200.0, 40.0));
+
+        let mut app = PdfUtilityApp::new(Some(path.clone()));
+        app.overlay.add(OverlayElement::TextBox(TextBoxElement {
+            id: Uuid::new_v4(),
+            page_index: 0,
+            rect,
+            text: "HELLO WORLD".into(),
+        }));
+        app.save();
+        assert!(app.error_message.is_none());
+
+        let mut app = PdfUtilityApp::new(Some(path.clone()));
+        assert!(app.error_message.is_none());
+        assert_eq!(app.overlay.elements.len(), 1);
+        assert!(matches!(
+            &app.overlay.elements[0],
+            OverlayElement::TextBox(tb) if tb.text == "HELLO WORLD"
+        ));
+        // Not also drawn as static pixels under the live element.
+        assert_eq!(ink_in(app.document.as_ref().unwrap(), 0, rect), 0);
+        // ...and it's selectable through the real click path.
+        app.handle_canvas_click(rect.center(), big_image_rect());
+        assert_eq!(app.selected_element, Some(app.overlay.elements[0].id()));
+
+        app.save();
+        let reopened = PdfDocumentState::open(&path).unwrap();
+        assert_eq!(
+            pdf_utility::annotations::read_overlay_from_annotations(&reopened, 0).len(),
+            1
         );
     }
 

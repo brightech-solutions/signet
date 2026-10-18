@@ -22,10 +22,19 @@ use std::path::{Path, PathBuf};
 use crate::document::{DocumentError, PdfDocumentState};
 use crate::overlay::OverlayLayer;
 
-use crate::annotations::write_overlay_to_annotations;
+use crate::annotations::{remove_overlay_annotations, write_overlay_to_annotations};
 
 /// Writes every element in `overlay` onto its page as an annotation, then
 /// writes `doc` out to `path`.
+///
+/// `overlay` is the single source of truth for the app's own annotations:
+/// any already on a page (from an earlier save in this session, or left by
+/// a caller) are deleted first, so saving twice never duplicates an element
+/// and a moved/deleted element never leaves a ghost behind. Once the file
+/// is written (or the write fails) they're deleted from the in-memory
+/// document again, so the page keeps rendering *without* them while the
+/// overlay stays the live, editable copy — otherwise every element would
+/// be drawn twice on screen, and the static copy wouldn't follow a move.
 ///
 /// Elements are grouped by `page_index` first because
 /// [`write_overlay_to_annotations`] takes one page's elements at a time;
@@ -38,22 +47,35 @@ pub fn save(
 ) -> Result<(), DocumentError> {
     let page_count = doc.page_count();
 
-    for page_index in 0..page_count {
-        let elements_on_page: Vec<_> = overlay
-            .elements
-            .iter()
-            .filter(|element| element.page_index() == page_index)
-            .cloned()
-            .collect();
+    let result = (|| {
+        for page_index in 0..page_count {
+            remove_overlay_annotations(doc, page_index)?;
 
-        if elements_on_page.is_empty() {
-            continue;
+            let elements_on_page: Vec<_> = overlay
+                .elements
+                .iter()
+                .filter(|element| element.page_index() == page_index)
+                .cloned()
+                .collect();
+
+            if elements_on_page.is_empty() {
+                continue;
+            }
+
+            write_overlay_to_annotations(doc, page_index, &elements_on_page)?;
         }
 
-        write_overlay_to_annotations(doc, page_index, &elements_on_page)?;
+        write_document_atomically(doc, path)
+    })();
+
+    let mut cleanup = Ok(());
+    for page_index in 0..page_count {
+        if let Err(err) = remove_overlay_annotations(doc, page_index) {
+            cleanup = Err(err);
+        }
     }
 
-    write_document_atomically(doc, path)
+    result.and(cleanup)
 }
 
 /// Writes `doc` to `path` without ever truncating `path` itself mid-write.

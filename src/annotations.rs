@@ -32,7 +32,7 @@ use pdfium_render::prelude::*;
 use uuid::Uuid;
 
 use crate::document::{DocumentError, PdfDocumentState};
-use crate::overlay::{OverlayElement, SignatureElement, TextBoxElement};
+use crate::overlay::{OverlayElement, OverlayLayer, SignatureElement, TextBoxElement};
 
 /// The value written to every annotation this app creates' `/T` (title /
 /// author) field, and the only value [`read_overlay_from_annotations`]
@@ -254,11 +254,12 @@ fn write_signature_annotation(
 /// out-of-bounds `page_index` is an error, like a failed delete.
 ///
 /// Used so the document never holds a stale copy of the overlay: on open
-/// (after reading the elements back with [`read_overlay_from_annotations`],
-/// so they aren't drawn twice — once baked into the page render, once as
-/// the live overlay), and before every Save/Apply writes the overlay's
-/// current state (so a repeated save, or a moved/deleted element, can't
-/// leave duplicate or ghost annotations behind).
+/// (via [`take_overlay_from_document`], so they aren't drawn twice — once
+/// in the page render, once as the live overlay), before every Save/Apply
+/// writes the overlay's current state (so a repeated save, or a
+/// moved/deleted element, can't leave duplicate or ghost annotations
+/// behind), and again after Save has written the file (so the in-memory
+/// page keeps rendering without them while the overlay stays editable).
 pub fn remove_overlay_annotations(
     doc: &mut PdfDocumentState,
     page_index: usize,
@@ -287,6 +288,27 @@ pub fn remove_overlay_annotations(
     }
 
     Ok(removed)
+}
+
+/// Moves the app's own annotations out of `doc` and into an editable
+/// [`OverlayLayer`]: for every page, reads them back with
+/// [`read_overlay_from_annotations`], then deletes them from the page with
+/// [`remove_overlay_annotations`] so they aren't *also* drawn as static
+/// page pixels underneath the live, movable overlay elements.
+///
+/// Called right after a document is opened, so text boxes and signatures
+/// saved by an earlier session come back as real, editable elements.
+pub fn take_overlay_from_document(
+    doc: &mut PdfDocumentState,
+) -> Result<OverlayLayer, DocumentError> {
+    let mut overlay = OverlayLayer::default();
+    for page_index in 0..doc.page_count() {
+        for element in read_overlay_from_annotations(doc, page_index) {
+            overlay.add(element);
+        }
+        remove_overlay_annotations(doc, page_index)?;
+    }
+    Ok(overlay)
 }
 
 /// Reconstructs the [`OverlayElement`]s previously written to page
