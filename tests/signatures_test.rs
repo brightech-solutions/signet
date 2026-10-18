@@ -42,7 +42,44 @@ fn remove_deletes_entry() {
     let tmp = tempfile::tempdir().unwrap();
     let mut lib = SignatureLibrary::load(tmp.path());
     let id = lib.add_typed(tmp.path(), "Typed", "Jane Doe", "script-font-1");
-    lib.remove(id);
+    lib.remove(tmp.path(), id);
+    assert!(lib.entries.is_empty());
+}
+
+/// Final review Important #5: deleting an image signature must delete its
+/// backing `<id>.png` too, not leave the user's signature image on disk.
+#[test]
+fn remove_deletes_image_signature_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("sig.png");
+    image::RgbaImage::new(10, 10).save(&source).unwrap();
+    let mut lib = SignatureLibrary::load(tmp.path());
+    let id = lib.add_image(tmp.path(), "My signature", &source).unwrap();
+    let image_path = lib.image_path_for(tmp.path(), id).unwrap();
+    assert!(image_path.exists());
+
+    lib.remove(tmp.path(), id);
+
+    assert!(lib.entries.is_empty());
+    assert!(!image_path.exists(), "signature image left on disk");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+/// The file deletion is best-effort: an image that's already gone must
+/// not stop the entry itself being removed (or panic).
+#[test]
+fn remove_tolerates_an_already_missing_image_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("sig.png");
+    image::RgbaImage::new(10, 10).save(&source).unwrap();
+    let mut lib = SignatureLibrary::load(tmp.path());
+    let id = lib.add_image(tmp.path(), "My signature", &source).unwrap();
+    std::fs::remove_file(lib.image_path_for(tmp.path(), id).unwrap()).unwrap();
+
+    lib.remove(tmp.path(), id);
+
     assert!(lib.entries.is_empty());
 }
 

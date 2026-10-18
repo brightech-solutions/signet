@@ -197,12 +197,16 @@ impl SignatureLibrary {
         id
     }
 
-    /// Removes the entry with the given `id`, if present. A no-op if no
-    /// entry with that id exists. Does not delete an image-backed entry's
-    /// file on disk — the manifest is the source of truth for what's "in"
-    /// the library, and leaving an orphaned file behind is harmless; wiring
-    /// up file cleanup is left to whichever caller cares (none does yet).
-    pub fn remove(&mut self, id: Uuid) {
+    /// Removes the entry with the given `id`, if present, and — for an
+    /// image-backed entry — deletes its `<dir>/<file_name>` image too, so a
+    /// deleted signature doesn't linger on disk. The file deletion is
+    /// best-effort: an already-missing (or otherwise undeletable) file
+    /// doesn't stop the entry being removed. A no-op if no entry with that
+    /// id exists.
+    pub fn remove(&mut self, dir: &Path, id: Uuid) {
+        if let Some(image_path) = self.image_path_for(dir, id) {
+            let _ = std::fs::remove_file(image_path);
+        }
         self.entries.retain(|entry| entry.id != id);
     }
 

@@ -174,7 +174,7 @@ impl SignaturePanelState {
         }
 
         if let Some(id) = to_remove {
-            library.remove(id);
+            library.remove(dir, id);
             self.thumbnails.remove(&id);
             let _ = library.save(dir);
         }
