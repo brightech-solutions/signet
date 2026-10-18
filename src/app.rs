@@ -144,6 +144,28 @@ fn default_signature_rect(origin: egui::Pos2, image_size: [usize; 2]) -> egui::R
     egui::Rect::from_min_size(origin, size)
 }
 
+/// Something the user asked for that would throw away unsaved changes, held
+/// back while the "unsaved changes" confirmation is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingAction {
+    /// File → Open picked this path.
+    Open(PathBuf),
+    /// The window's close button (or similar) was pressed.
+    Close,
+}
+
+/// The user's answer in the "unsaved changes" confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsavedChoice {
+    /// Save first (Save, or Save As if there's no path yet), then continue
+    /// only if that save succeeded.
+    Save,
+    /// Continue without saving, losing the changes.
+    Discard,
+    /// Don't continue; keep the current document open and edited.
+    Cancel,
+}
+
 /// The viewer's page/zoom state.
 ///
 /// Read by later tasks' overlay/canvas code (together with
@@ -192,6 +214,19 @@ pub struct PdfUtilityApp {
     /// then lost, since nothing entered after a flatten can ever be baked
     /// into the document's content again.
     applied: bool,
+    /// `true` when the open document has changes not yet written to disk:
+    /// set by every mutation (a committed field edit, adding / editing /
+    /// moving / resizing / deleting an overlay element, a successful
+    /// Apply), cleared by a successful Save / Save As and by opening a
+    /// document. While `true`, File → Open and closing the window first ask
+    /// for confirmation (see `pending_action`).
+    dirty: bool,
+    /// An Open or Close held back while the "unsaved changes" confirmation
+    /// is shown; `None` when no confirmation is pending.
+    pending_action: Option<PendingAction>,
+    /// Set once the user has confirmed closing (by discarding or saving),
+    /// so the close request that follows isn't intercepted again.
+    close_confirmed: bool,
     /// The texture for the currently-rendered page, plus the (page, zoom)
     /// it was rendered for, so we only re-rasterize when something changed.
     texture: Option<egui::TextureHandle>,
@@ -268,6 +303,9 @@ impl PdfUtilityApp {
             error_message: None,
             info_message: None,
             applied: false,
+            dirty: false,
+            pending_action: None,
+            close_confirmed: false,
             texture: None,
             texture_key: None,
             focused_field: None,
@@ -312,6 +350,8 @@ impl PdfUtilityApp {
                 self.error_message = None;
                 self.info_message = None;
                 self.applied = false;
+                self.dirty = false;
+                self.pending_action = None;
                 self.texture = None;
                 self.texture_key = None;
                 self.focused_field = None;
@@ -328,6 +368,8 @@ impl PdfUtilityApp {
                 self.current_file_path = None;
                 self.info_message = None;
                 self.applied = false;
+                self.dirty = false;
+                self.pending_action = None;
                 self.texture = None;
                 self.texture_key = None;
                 self.focused_field = None;
@@ -340,6 +382,110 @@ impl PdfUtilityApp {
                 self.request_focus_for = None;
                 self.error_message = Some(error_message_for(&err));
             }
+        }
+    }
+
+    /// File → Open's entry point: opens `path` straight away if there's
+    /// nothing unsaved, otherwise holds it back as a [`PendingAction`] so
+    /// the "unsaved changes" confirmation is shown first. A field edit
+    /// still sitting in its editor counts as a change.
+    fn request_open(&mut self, path: PathBuf) {
+        self.commit_field_edit();
+        if self.dirty {
+            self.pending_action = Some(PendingAction::Open(path));
+        } else {
+            self.open_path(&path);
+        }
+    }
+
+    /// Called when the window has been asked to close. Returns `true` if
+    /// the close must be cancelled (there are unsaved changes the user
+    /// hasn't confirmed losing), in which case the confirmation is queued.
+    fn intercept_close(&mut self) -> bool {
+        if self.close_confirmed {
+            return false;
+        }
+        self.commit_field_edit();
+        if self.dirty {
+            self.pending_action = Some(PendingAction::Close);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Acts on the user's answer to the "unsaved changes" confirmation for
+    /// the pending action. Returns `true` if the window should now close.
+    fn resolve_pending_action(&mut self, choice: UnsavedChoice) -> bool {
+        let Some(action) = self.pending_action.take() else {
+            return false;
+        };
+
+        match choice {
+            UnsavedChoice::Cancel => return false,
+            UnsavedChoice::Save => {
+                if self.current_file_path.is_some() {
+                    self.save();
+                } else {
+                    self.save_as();
+                }
+                if self.dirty {
+                    // Save failed or was cancelled: keep everything as is.
+                    return false;
+                }
+            }
+            UnsavedChoice::Discard => {}
+        }
+
+        match action {
+            PendingAction::Open(path) => {
+                self.open_path(&path);
+                false
+            }
+            PendingAction::Close => {
+                self.close_confirmed = true;
+                true
+            }
+        }
+    }
+
+    /// Draws the "unsaved changes" confirmation while an action is pending.
+    fn unsaved_changes_modal(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.pending_action.clone() else {
+            return;
+        };
+        let what = match action {
+            PendingAction::Open(_) => "opening another file",
+            PendingAction::Close => "closing",
+        };
+
+        let mut choice = None;
+        let response = egui::Modal::new(egui::Id::unique("unsaved_changes_modal")).show(ctx, |ui| {
+            ui.set_max_width(340.0);
+            ui.label(format!(
+                "This document has unsaved changes. Save them before {what}?"
+            ));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    choice = Some(UnsavedChoice::Save);
+                }
+                if ui.button("Don't Save").clicked() {
+                    choice = Some(UnsavedChoice::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(UnsavedChoice::Cancel);
+                }
+            });
+        });
+        if choice.is_none() && response.should_close() {
+            choice = Some(UnsavedChoice::Cancel);
+        }
+
+        if let Some(choice) = choice
+            && self.resolve_pending_action(choice)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -357,7 +503,10 @@ impl PdfUtilityApp {
         };
 
         match save::save(document, &self.overlay, path) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.dirty = false;
+                true
+            }
             Err(err) => {
                 self.error_message = Some(error_message_for(&err));
                 false
@@ -427,6 +576,7 @@ impl PdfUtilityApp {
         match result {
             Ok(()) => {
                 self.applied = true;
+                self.dirty = true;
                 self.overlay = OverlayLayer::default();
                 self.signature_textures.clear();
                 self.tool_mode = ToolMode::default();
@@ -482,7 +632,7 @@ impl PdfUtilityApp {
                         .add_filter("PDF", &["pdf"])
                         .pick_file()
                     {
-                        self.open_path(&path);
+                        self.request_open(path);
                     }
                 }
 
@@ -748,6 +898,7 @@ impl PdfUtilityApp {
                         self.selected_element = Some(id);
                         self.editing_text_box = Some(id);
                         self.request_focus_for = Some(id);
+                        self.dirty = true;
                     }
                     ToolMode::PlaceSignature(entry_id) => {
                         self.place_signature_from_library(entry_id, page_point);
@@ -799,6 +950,7 @@ impl PdfUtilityApp {
             }));
         self.selected_element = Some(id);
         self.editing_text_box = None;
+        self.dirty = true;
     }
 
     /// Returns the id of the topmost overlay element on the current page
@@ -897,9 +1049,11 @@ impl PdfUtilityApp {
         }
 
         let result = form_fields::set_field_value(document, &name, &buffer);
-        // Invalidate even on failure: `set_field_value` may already have
-        // changed `/V` before the appearance refresh failed.
+        // Invalidate (and mark dirty) even on failure: `set_field_value`
+        // may already have changed `/V` before the appearance refresh
+        // failed.
         self.invalidate_page_texture();
+        self.dirty = true;
         if let Err(err) = result {
             self.error_message = Some(error_message_for(&err));
         }
@@ -986,6 +1140,9 @@ impl PdfUtilityApp {
                         response.request_focus();
                         self.request_focus_for = None;
                     }
+                    if response.changed() {
+                        self.dirty = true;
+                    }
                     if response.lost_focus() {
                         self.editing_text_box = None;
                     }
@@ -1051,6 +1208,9 @@ impl PdfUtilityApp {
                     let delta_page = canvas::screen_delta_to_page(body_response.drag_delta(), zoom);
                     self.overlay
                         .move_element(id, page_rect.min + delta_page, page_size);
+                    if body_response.drag_delta() != egui::Vec2::ZERO {
+                        self.dirty = true;
+                    }
                 }
             }
 
@@ -1080,6 +1240,9 @@ impl PdfUtilityApp {
                             canvas::screen_delta_to_page(handle_response.drag_delta(), zoom);
                         let new_rect = resize_rect_for_corner(current_rect, corner, delta_page);
                         self.overlay.resize_element(id, new_rect, page_size);
+                        if handle_response.drag_delta() != egui::Vec2::ZERO {
+                            self.dirty = true;
+                        }
                     }
                 }
 
@@ -1127,6 +1290,9 @@ impl PdfUtilityApp {
     /// it, and its cached GPU texture in `signature_textures` if it has
     /// one (a no-op for a text box, which never gets an entry there).
     fn remove_overlay_element(&mut self, id: Uuid) {
+        if self.overlay.get(id).is_some() {
+            self.dirty = true;
+        }
         self.overlay.remove(id);
         self.signature_textures.remove(&id);
         if self.selected_element == Some(id) {
@@ -1290,8 +1456,16 @@ impl eframe::App for PdfUtilityApp {
                 });
         });
 
+        // Closing the window with unsaved changes: cancel the close this
+        // frame (eframe only exits if no `CancelClose` was sent during the
+        // frame that saw the request) and ask first.
+        if ctx.input(|input| input.viewport().close_requested()) && self.intercept_close() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+
         self.error_modal(&ctx);
         self.info_modal(&ctx);
+        self.unsaved_changes_modal(&ctx);
     }
 }
 
@@ -1487,6 +1661,196 @@ mod tests {
             pdf_utility::annotations::read_overlay_from_annotations(&reopened, 0).len(),
             1
         );
+    }
+
+    /// An app with a private, writable copy of `fixture` open (so Save in a
+    /// test can never overwrite a fixture).
+    fn app_with_temp_copy(fixture: &str) -> (tempfile::TempDir, PathBuf, PdfUtilityApp) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.pdf");
+        std::fs::copy(fixture, &path).unwrap();
+        let app = PdfUtilityApp::new(Some(path.clone()));
+        (tmp, path, app)
+    }
+
+    fn add_text_box_by_click(app: &mut PdfUtilityApp, page_point: egui::Pos2) {
+        app.tool_mode = ToolMode::AddTextBox;
+        app.handle_canvas_click(page_point, big_image_rect());
+        app.tool_mode = ToolMode::Select;
+    }
+
+    /// Final review Important #6: the dirty flag's transitions — clean on
+    /// open, set by each kind of mutation, cleared by a successful save.
+    #[test]
+    fn dirty_flag_tracks_mutations_and_saves() {
+        let (_tmp, _path, mut app) = app_with_temp_copy("tests/fixtures/sample_form.pdf");
+        assert!(!app.dirty, "freshly opened document is clean");
+
+        // Adding an overlay element.
+        add_text_box_by_click(&mut app, egui::pos2(5.0, 5.0));
+        assert!(app.dirty);
+        app.save();
+        assert!(app.error_message.is_none(), "{:?}", app.error_message);
+        assert!(!app.dirty, "a successful save clears the flag");
+
+        // Deleting an overlay element.
+        let id = app.overlay.elements[0].id();
+        app.remove_overlay_element(id);
+        assert!(app.dirty);
+        app.save();
+        assert!(!app.dirty);
+
+        // Placing a signature.
+        let dir = app.signature_dir.clone();
+        let entry_id = app
+            .signature_library
+            .add_typed(&dir, "Jane", "Jane Doe", "default");
+        app.place_signature_from_library(entry_id, egui::pos2(300.0, 300.0));
+        app.signature_library.entries.retain(|entry| entry.id != entry_id);
+        assert!(app.dirty);
+        app.save();
+        assert!(!app.dirty);
+
+        // A committed field edit — but re-committing the same value isn't
+        // a change.
+        let rect = applicant_field_rect(&app);
+        app.handle_canvas_click(rect.center(), big_image_rect());
+        app.commit_field_edit();
+        assert!(!app.dirty, "focusing a field without changing it is not an edit");
+        app.field_values
+            .insert("applicant_name".to_string(), "Jane Doe".to_string());
+        app.commit_field_edit();
+        assert!(app.dirty);
+        app.save();
+        assert!(!app.dirty);
+
+        // A successful Apply.
+        app.apply();
+        assert!(app.applied);
+        assert!(app.dirty, "an applied-but-unsaved document is unsaved work");
+        app.save();
+        assert!(!app.dirty);
+    }
+
+    /// A failed save leaves the document dirty.
+    #[test]
+    fn failed_save_leaves_document_dirty() {
+        let mut app = app_with_plain_pdf();
+        add_text_box_by_click(&mut app, egui::pos2(5.0, 5.0));
+        assert!(!app.save_to(Path::new("/nonexistent-dir/for/sure/out.pdf")));
+        assert!(app.dirty);
+    }
+
+    /// File → Open on a clean document opens straight away.
+    #[test]
+    fn open_with_no_unsaved_changes_proceeds_immediately() {
+        let mut app = app_with_plain_pdf();
+        app.request_open(PathBuf::from("tests/fixtures/sample_form.pdf"));
+        assert!(app.pending_action.is_none());
+        assert_eq!(
+            app.current_file_path,
+            Some(PathBuf::from("tests/fixtures/sample_form.pdf"))
+        );
+    }
+
+    /// File → Open with unsaved changes asks first: Cancel keeps the
+    /// current document and its edits; Don't Save then opens the new file.
+    #[test]
+    fn open_with_unsaved_changes_asks_first() {
+        let mut app = app_with_plain_pdf();
+        add_text_box_by_click(&mut app, egui::pos2(5.0, 5.0));
+
+        app.request_open(PathBuf::from("tests/fixtures/sample_form.pdf"));
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::Open(PathBuf::from("tests/fixtures/sample_form.pdf")))
+        );
+        assert_eq!(
+            app.current_file_path,
+            Some(PathBuf::from("tests/fixtures/sample_plain.pdf")),
+            "opened before the user answered"
+        );
+
+        assert!(!app.resolve_pending_action(UnsavedChoice::Cancel));
+        assert!(app.pending_action.is_none());
+        assert!(app.dirty);
+        assert_eq!(app.overlay.elements.len(), 1, "cancel lost the edit");
+        assert_eq!(
+            app.current_file_path,
+            Some(PathBuf::from("tests/fixtures/sample_plain.pdf"))
+        );
+
+        app.request_open(PathBuf::from("tests/fixtures/sample_form.pdf"));
+        assert!(!app.resolve_pending_action(UnsavedChoice::Discard));
+        assert_eq!(
+            app.current_file_path,
+            Some(PathBuf::from("tests/fixtures/sample_form.pdf"))
+        );
+        assert!(!app.dirty);
+        assert!(app.overlay.elements.is_empty());
+    }
+
+    /// An uncommitted field edit still in its editor counts as unsaved.
+    #[test]
+    fn uncommitted_field_edit_counts_as_unsaved_on_open() {
+        let mut app = app_with_form_pdf();
+        let rect = applicant_field_rect(&app);
+        app.handle_canvas_click(rect.center(), big_image_rect());
+        app.field_values
+            .insert("applicant_name".to_string(), "Jane Doe".to_string());
+
+        app.request_open(PathBuf::from("tests/fixtures/sample_plain.pdf"));
+
+        assert!(matches!(app.pending_action, Some(PendingAction::Open(_))));
+    }
+
+    /// Closing with unsaved changes is intercepted; Don't Save lets the
+    /// close through (and doesn't intercept the follow-up request).
+    #[test]
+    fn close_with_unsaved_changes_is_intercepted_until_confirmed() {
+        let mut app = app_with_plain_pdf();
+        assert!(!app.intercept_close(), "a clean document closes freely");
+
+        add_text_box_by_click(&mut app, egui::pos2(5.0, 5.0));
+        assert!(app.intercept_close());
+        assert_eq!(app.pending_action, Some(PendingAction::Close));
+
+        assert!(!app.resolve_pending_action(UnsavedChoice::Cancel));
+        assert!(app.intercept_close(), "cancel, then close again: still asks");
+
+        assert!(app.resolve_pending_action(UnsavedChoice::Discard));
+        assert!(!app.intercept_close());
+    }
+
+    /// Save in the confirmation really writes the file, then closes.
+    #[test]
+    fn save_choice_writes_the_file_then_closes() {
+        let (_tmp, path, mut app) = app_with_temp_copy("tests/fixtures/sample_plain.pdf");
+        add_text_box_by_click(&mut app, egui::pos2(5.0, 5.0));
+        assert!(app.intercept_close());
+
+        assert!(app.resolve_pending_action(UnsavedChoice::Save));
+        assert!(!app.dirty);
+        let reopened = PdfDocumentState::open(&path).unwrap();
+        assert_eq!(
+            pdf_utility::annotations::read_overlay_from_annotations(&reopened, 0).len(),
+            1
+        );
+    }
+
+    /// If that save fails, nothing is lost: the window stays open and the
+    /// document stays dirty.
+    #[test]
+    fn failed_save_choice_does_not_close() {
+        let mut app = app_with_plain_pdf();
+        add_text_box_by_click(&mut app, egui::pos2(5.0, 5.0));
+        app.current_file_path = Some(PathBuf::from("/nonexistent-dir/for/sure/out.pdf"));
+        assert!(app.intercept_close());
+
+        assert!(!app.resolve_pending_action(UnsavedChoice::Save));
+        assert!(app.dirty);
+        assert!(app.error_message.is_some());
+        assert!(app.intercept_close(), "the next close attempt still asks");
     }
 
     /// `save_to` (the shared helper behind both "Save" and "Save As") writes
