@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use pdf_utility::annotations;
 use pdf_utility::apply;
 use pdf_utility::document::{DocumentError, PdfDocumentState};
 use pdf_utility::form_fields::{self, FieldKind};
@@ -390,13 +389,12 @@ impl PdfUtilityApp {
         }
     }
 
-    /// "Apply": bakes every current overlay element onto its page as a real
-    /// annotation (the same step `save` takes, via
-    /// `annotations::write_overlay_to_annotations`, just without also
-    /// writing the file), then flattens the whole document via
-    /// `apply::flatten` so those annotations — and the AcroForm fields
-    /// already filled via `form_fields::set_field_value` — become part of
-    /// each page's content and stop being separate, editable objects.
+    /// "Apply": via `apply::apply`, writes every current overlay element
+    /// onto its page as an annotation (replacing any of the app's own
+    /// annotations already there), then flattens the whole document so
+    /// those annotations — and the AcroForm fields already filled via
+    /// `form_fields::set_field_value` — become part of each page's content
+    /// and stop being separate, editable objects.
     ///
     /// On success: sets `applied`, clears the now-baked-in overlay (leaving
     /// it populated would let a later `save` re-write those same elements
@@ -413,31 +411,12 @@ impl PdfUtilityApp {
         // Bake the field editor's pending value too, not the stale one.
         self.commit_field_edit();
 
-        let page_count = self.document.as_ref().unwrap().page_count();
-        for page_index in 0..page_count {
-            let elements_on_page: Vec<_> = self
-                .overlay
-                .elements
-                .iter()
-                .filter(|element| element.page_index() == page_index)
-                .cloned()
-                .collect();
-
-            if elements_on_page.is_empty() {
-                continue;
-            }
-
-            let document = self.document.as_mut().unwrap();
-            if let Err(err) =
-                annotations::write_overlay_to_annotations(document, page_index, &elements_on_page)
-            {
-                self.error_message = Some(error_message_for(&err));
-                return;
-            }
-        }
-
         let document = self.document.as_mut().unwrap();
-        match apply::flatten(document) {
+        let result = apply::apply(document, &self.overlay);
+        // The page's rendered content changed (or, on a part-way failure,
+        // may have): never keep showing the pre-Apply texture.
+        self.invalidate_page_texture();
+        match result {
             Ok(()) => {
                 self.applied = true;
                 self.overlay = OverlayLayer::default();
@@ -1703,9 +1682,20 @@ mod tests {
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
         app.handle_canvas_click(egui::pos2(5.0, 5.0), image_rect);
         assert_eq!(app.overlay.elements.len(), 1);
+        let text_rect = app.overlay.elements[0].rect();
+        if let OverlayElement::TextBox(text_box) = &mut app.overlay.elements[0] {
+            text_box.text = "HELLO WORLD".into();
+        }
+        let ctx = egui::Context::default();
+        app.ensure_texture(&ctx);
 
         app.apply();
 
+        assert!(app.texture_key.is_none(), "stale pre-Apply page texture kept");
+        assert!(
+            ink_in(app.document.as_ref().unwrap(), 0, text_rect) > 50,
+            "text box not baked into the page"
+        );
         assert!(app.applied);
         assert!(app.error_message.is_none());
         assert!(app.info_message.is_some());
