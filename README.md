@@ -82,9 +82,17 @@ cargo test
 - No merge/split/reorder, OCR, redaction, or encryption features — this
   tool is intentionally scoped to view/fill/sign only.
 
-## License notes
+## AI-assisted development
 
-This project bundles two third-party assets:
+This project's code, tests, and packaging scripts were written largely by
+AI (Claude, via Claude Code), working from a human-authored design and
+implementation plan, with human review and direction throughout.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+This project bundles two third-party assets, under their own licenses:
 - `vendor/pdfium/` — prebuilt pdfium binaries (BSD-3-Clause; see
   `vendor/pdfium/LICENSE`).
 - `assets/fonts/ShadowsIntoLight.ttf` — "Shadows Into Light" by Kimberly
