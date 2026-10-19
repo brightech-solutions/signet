@@ -3000,25 +3000,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
-name = "pdf_utility"
-version = "0.1.0"
-dependencies = [
- "ab_glyph",
- "eframe",
- "egui",
- "epaint_default_fonts",
- "image",
- "lopdf",
- "once_cell",
- "pdfium-render",
- "rfd",
- "serde",
- "serde_json",
- "tempfile",
- "uuid",
-]
-
-[[package]]
 name = "pdfium-render"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3811,6 +3792,29 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "signet"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "eframe",
+ "egui",
+ "epaint_default_fonts",
+ "image",
+ "lopdf",
+ "objc2 0.5.3",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+ "once_cell",
+ "pdfium-render",
+ "rfd",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+ "winit",
 ]
 
 [[package]]

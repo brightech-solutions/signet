@@ -3,13 +3,13 @@ mod common;
 use std::path::Path;
 
 use common::ink_in;
-use pdf_utility::annotations::{
+use signet::annotations::{
     read_overlay_from_annotations, remove_overlay_annotations, write_overlay_to_annotations,
 };
-use pdf_utility::document::PdfDocumentState;
-use pdf_utility::form_fields::fields_on_page;
-use pdf_utility::overlay::{OverlayElement, SignatureElement, TextBoxElement};
-use pdf_utility::signatures::{SignatureEntry, SignatureSource, render_signature_entry};
+use signet::document::PdfDocumentState;
+use signet::form_fields::fields_on_page;
+use signet::overlay::{OverlayElement, SignatureElement, TextBoxElement};
+use signet::signatures::{SignatureEntry, SignatureSource, render_signature_entry};
 use uuid::Uuid;
 
 #[test]
@@ -60,7 +60,7 @@ fn real_placed_signature_image_round_trips_through_annotations() {
         name: "Jane Doe".to_string(),
         source: SignatureSource::Typed {
             text: "Jane Doe".to_string(),
-            font_id: pdf_utility::signatures::SCRIPT_FONT_ID.to_string(),
+            font_id: signet::signatures::SCRIPT_FONT_ID.to_string(),
         },
         created: "0".to_string(),
     };
@@ -110,7 +110,7 @@ fn saved_multiline_text_box_renders_each_line_and_no_border() {
 
     let mut doc = PdfDocumentState::open(Path::new("tests/fixtures/sample_plain.pdf")).unwrap();
     let text = "FIRST LINE\nSECOND LINE";
-    let overlay = pdf_utility::overlay::OverlayLayer {
+    let overlay = signet::overlay::OverlayLayer {
         elements: vec![OverlayElement::TextBox(TextBoxElement {
             id: Uuid::new_v4(),
             page_index: 0,
@@ -118,7 +118,7 @@ fn saved_multiline_text_box_renders_each_line_and_no_border() {
             text: text.into(),
         })],
     };
-    pdf_utility::save::save(&mut doc, &overlay, &path).unwrap();
+    signet::save::save(&mut doc, &overlay, &path).unwrap();
     drop(doc);
 
     let reopened = PdfDocumentState::open(&path).unwrap();

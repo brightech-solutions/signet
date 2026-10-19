@@ -1,4 +1,4 @@
-//! The root `eframe::App` for PDF Utility.
+//! The root `eframe::App` for Signet.
 //!
 //! Owns the currently open document (if any), the viewer's page/zoom state,
 //! and the rendered-page texture. File → Open and the zoom/page controls all
@@ -8,13 +8,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use pdf_utility::annotations;
-use pdf_utility::apply;
-use pdf_utility::document::{DocumentError, PdfDocumentState};
-use pdf_utility::form_fields::{self, FieldKind};
-use pdf_utility::overlay::{self, OverlayElement, OverlayLayer, SignatureElement, TextBoxElement};
-use pdf_utility::save;
-use pdf_utility::signatures::{self, SignatureLibrary};
+use signet::annotations;
+use signet::apply;
+use signet::document::{DocumentError, PdfDocumentState};
+use signet::form_fields::{self, FieldKind};
+use signet::overlay::{self, OverlayElement, OverlayLayer, SignatureElement, TextBoxElement};
+use signet::save;
+use signet::signatures::{self, SignatureLibrary};
 use uuid::Uuid;
 
 use crate::ui::canvas;
@@ -186,7 +186,7 @@ impl Default for ViewerState {
 }
 
 /// Root application state.
-pub struct PdfUtilityApp {
+pub struct SignetApp {
     document: Option<PdfDocumentState>,
     /// The path the current document was opened from, or last saved to via
     /// "Save As" — i.e. the destination "Save" overwrites. Set on a
@@ -289,10 +289,16 @@ pub struct PdfUtilityApp {
     signature_panel: SignaturePanelState,
 }
 
-impl PdfUtilityApp {
-    /// Creates the app, optionally opening `initial_path` immediately (used
-    /// for launch-arg / Finder double-click open).
+impl SignetApp {
+    /// Creates the app, optionally opening a file immediately: `initial_path`
+    /// for a direct CLI launch, or — if that's `None` — whatever path a
+    /// Finder double-click / "Open With" launch handed `macos_open`'s
+    /// delegate before this constructor ran.
     pub fn new(initial_path: Option<PathBuf>) -> Self {
+        #[cfg(target_os = "macos")]
+        let initial_path =
+            initial_path.or_else(|| crate::macos_open::take_pending_opens().into_iter().next());
+
         let signature_dir = signature_library_dir();
         let signature_library = SignatureLibrary::load(&signature_dir);
 
@@ -1355,11 +1361,11 @@ impl PdfUtilityApp {
 
 /// The bundle id from `packaging/Info.plist`'s `CFBundleIdentifier`, used
 /// to namespace this app's folder under Application Support.
-const BUNDLE_ID: &str = "com.brightech.pdfutility";
+const BUNDLE_ID: &str = "com.brightech.signet";
 
 /// Resolves the signature library's storage directory:
 /// `~/Library/Application Support/<bundle id>/signatures/`. Computed once,
-/// here, at app startup (from [`PdfUtilityApp::new`]) rather than
+/// here, at app startup (from [`SignetApp::new`]) rather than
 /// recomputed wherever the library is touched, so every part of the app
 /// agrees on where it lives for the life of the process — the directory
 /// itself is created lazily by `SignatureLibrary::save`/`add_image`, not
@@ -1393,9 +1399,17 @@ fn error_message_for(err: &DocumentError) -> String {
     }
 }
 
-impl eframe::App for PdfUtilityApp {
+impl eframe::App for SignetApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // An already-running app also gets Finder-initiated opens this way
+        // (a fresh launch is instead handled in `Self::new`): macOS delivers
+        // them to the same running process rather than starting a new one.
+        #[cfg(target_os = "macos")]
+        if let Some(path) = crate::macos_open::take_pending_opens().into_iter().next() {
+            self.request_open(path);
+        }
 
         egui::Panel::top("menu_bar_panel").show(ui, |ui| {
             self.menu_bar(ui);
@@ -1473,12 +1487,12 @@ impl eframe::App for PdfUtilityApp {
 mod tests {
     use super::*;
 
-    fn app_with_plain_pdf() -> PdfUtilityApp {
-        PdfUtilityApp::new(Some(PathBuf::from("tests/fixtures/sample_plain.pdf")))
+    fn app_with_plain_pdf() -> SignetApp {
+        SignetApp::new(Some(PathBuf::from("tests/fixtures/sample_plain.pdf")))
     }
 
-    fn app_with_form_pdf() -> PdfUtilityApp {
-        PdfUtilityApp::new(Some(PathBuf::from("tests/fixtures/sample_form.pdf")))
+    fn app_with_form_pdf() -> SignetApp {
+        SignetApp::new(Some(PathBuf::from("tests/fixtures/sample_form.pdf")))
     }
 
     /// Counts opaque, darker-than-mid-grey pixels of page `page_index`
@@ -1499,7 +1513,7 @@ mod tests {
         count
     }
 
-    fn applicant_field_rect(app: &PdfUtilityApp) -> egui::Rect {
+    fn applicant_field_rect(app: &SignetApp) -> egui::Rect {
         form_fields::fields_on_page(app.document.as_ref().unwrap(), 0)
             .into_iter()
             .find(|field| field.name == "applicant_name")
@@ -1588,7 +1602,7 @@ mod tests {
     /// expected to disable "Save" in that state.
     #[test]
     fn save_with_no_document_is_a_noop() {
-        let mut app = PdfUtilityApp::new(None);
+        let mut app = SignetApp::new(None);
         app.save();
         assert!(app.error_message.is_none());
     }
@@ -1596,14 +1610,14 @@ mod tests {
     /// `save()` writes the document (with its current field values and
     /// overlay) to `current_file_path`, overwriting it in place — exercising
     /// the real menu-wired path end-to-end, as opposed to `save_test.rs`,
-    /// which calls `pdf_utility::save::save` directly.
+    /// which calls `signet::save::save` directly.
     #[test]
     fn save_overwrites_current_file_path() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("doc.pdf");
         std::fs::copy("tests/fixtures/sample_form.pdf", &path).unwrap();
 
-        let mut app = PdfUtilityApp::new(Some(path.clone()));
+        let mut app = SignetApp::new(Some(path.clone()));
         form_fields::set_field_value(
             app.document.as_mut().unwrap(),
             "applicant_name",
@@ -1632,7 +1646,7 @@ mod tests {
         std::fs::copy("tests/fixtures/sample_plain.pdf", &path).unwrap();
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 300.0), egui::vec2(200.0, 40.0));
 
-        let mut app = PdfUtilityApp::new(Some(path.clone()));
+        let mut app = SignetApp::new(Some(path.clone()));
         app.overlay.add(OverlayElement::TextBox(TextBoxElement {
             id: Uuid::new_v4(),
             page_index: 0,
@@ -1642,7 +1656,7 @@ mod tests {
         app.save();
         assert!(app.error_message.is_none());
 
-        let mut app = PdfUtilityApp::new(Some(path.clone()));
+        let mut app = SignetApp::new(Some(path.clone()));
         assert!(app.error_message.is_none());
         assert_eq!(app.overlay.elements.len(), 1);
         assert!(matches!(
@@ -1658,22 +1672,22 @@ mod tests {
         app.save();
         let reopened = PdfDocumentState::open(&path).unwrap();
         assert_eq!(
-            pdf_utility::annotations::read_overlay_from_annotations(&reopened, 0).len(),
+            signet::annotations::read_overlay_from_annotations(&reopened, 0).len(),
             1
         );
     }
 
     /// An app with a private, writable copy of `fixture` open (so Save in a
     /// test can never overwrite a fixture).
-    fn app_with_temp_copy(fixture: &str) -> (tempfile::TempDir, PathBuf, PdfUtilityApp) {
+    fn app_with_temp_copy(fixture: &str) -> (tempfile::TempDir, PathBuf, SignetApp) {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("doc.pdf");
         std::fs::copy(fixture, &path).unwrap();
-        let app = PdfUtilityApp::new(Some(path.clone()));
+        let app = SignetApp::new(Some(path.clone()));
         (tmp, path, app)
     }
 
-    fn add_text_box_by_click(app: &mut PdfUtilityApp, page_point: egui::Pos2) {
+    fn add_text_box_by_click(app: &mut SignetApp, page_point: egui::Pos2) {
         app.tool_mode = ToolMode::AddTextBox;
         app.handle_canvas_click(page_point, big_image_rect());
         app.tool_mode = ToolMode::Select;
@@ -1833,7 +1847,7 @@ mod tests {
         assert!(!app.dirty);
         let reopened = PdfDocumentState::open(&path).unwrap();
         assert_eq!(
-            pdf_utility::annotations::read_overlay_from_annotations(&reopened, 0).len(),
+            signet::annotations::read_overlay_from_annotations(&reopened, 0).len(),
             1
         );
     }
@@ -2121,14 +2135,14 @@ mod tests {
 
         let document = app.document.as_ref().unwrap();
         assert!(form_fields::fields_on_page(document, 0).is_empty());
-        assert!(pdf_utility::annotations::read_overlay_from_annotations(document, 0).is_empty());
+        assert!(signet::annotations::read_overlay_from_annotations(document, 0).is_empty());
     }
 
     /// `apply()` with no document open must be a harmless no-op, mirroring
     /// `save_with_no_document_is_a_noop`.
     #[test]
     fn apply_with_no_document_is_a_noop() {
-        let mut app = PdfUtilityApp::new(None);
+        let mut app = SignetApp::new(None);
         app.apply();
         assert!(!app.applied);
         assert!(app.error_message.is_none());
@@ -2200,7 +2214,7 @@ mod tests {
         let path = tmp.path().join("doc.pdf");
         std::fs::copy("tests/fixtures/sample_form.pdf", &path).unwrap();
 
-        let mut app = PdfUtilityApp::new(Some(path.clone()));
+        let mut app = SignetApp::new(Some(path.clone()));
         form_fields::set_field_value(
             app.document.as_mut().unwrap(),
             "applicant_name",

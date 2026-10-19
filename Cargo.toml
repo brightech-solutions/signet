@@ -1,5 +1,5 @@
 [package]
-name = "pdf_utility"
+name = "signet"
 version = "0.1.0"
 edition = "2024"
 
@@ -16,6 +16,12 @@ rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 uuid = { version = "1.28.0", features = ["v4", "serde"] }
+winit = "0.30.13"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.2"
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication"] }
+objc2-foundation = { version = "0.2.2", features = ["NSURL", "NSArray", "NSObject", "NSString"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

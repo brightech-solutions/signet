@@ -3,11 +3,11 @@ mod common;
 use std::path::Path;
 
 use common::{app_annotation_count_in_file, ink_in, multipage_marker_rect};
-use pdf_utility::annotations::{read_overlay_from_annotations, take_overlay_from_document};
-use pdf_utility::document::PdfDocumentState;
-use pdf_utility::form_fields::{fields_on_page, get_field_value, set_field_value};
-use pdf_utility::overlay::{OverlayElement, OverlayLayer, TextBoxElement};
-use pdf_utility::save::save;
+use signet::annotations::{read_overlay_from_annotations, take_overlay_from_document};
+use signet::document::PdfDocumentState;
+use signet::form_fields::{fields_on_page, get_field_value, set_field_value};
+use signet::overlay::{OverlayElement, OverlayLayer, TextBoxElement};
+use signet::save::save;
 use uuid::Uuid;
 
 #[test]

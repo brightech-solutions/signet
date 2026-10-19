@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
 # packaging/bundle.sh — builds a universal (arm64 + x86_64), ad-hoc-signed
-# "PDF Utility.app" bundle from source.
+# "Signet.app" bundle from source.
 #
 # Steps:
 #   1. Build release binaries for aarch64-apple-darwin and x86_64-apple-darwin
 #      (installing the rustup targets first if missing).
 #   2. Combine them into one universal binary with `lipo -create`.
-#   3. Assemble the PDF Utility.app/Contents/{MacOS,Resources,Frameworks}
+#   3. Assemble the Signet.app/Contents/{MacOS,Resources,Frameworks}
 #      bundle structure.
 #   4. Copy the universal binary into Contents/MacOS/.
 #   5. Copy packaging/Info.plist into Contents/.
@@ -53,8 +53,8 @@ command -v codesign >/dev/null 2>&1 || {
     exit 1
 }
 
-BIN_NAME="pdf_utility"
-APP_NAME="PDF Utility.app"
+BIN_NAME="signet"
+APP_NAME="Signet.app"
 DIST_DIR="$REPO_ROOT/dist"
 APP_DIR="$DIST_DIR/$APP_NAME"
 TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
@@ -121,10 +121,10 @@ FRAMEWORK_DYLIB="$APP_DIR/Contents/Frameworks/libpdfium.dylib"
 lipo -create -output "$FRAMEWORK_DYLIB" "$ARM64_DYLIB" "$X86_64_DYLIB"
 
 # Give the bundled dylib a clean, relocatable ID. This is hygiene rather
-# than a functional requirement: pdf_utility resolves the dylib's absolute
+# than a functional requirement: signet resolves the dylib's absolute
 # path itself at runtime (see src/document.rs: vendored_library_path) and
 # dlopen()s it directly via pdfium-render's dynamic binding, so there is no
-# load command in the pdf_utility binary pointing at this dylib for
+# load command in the signet binary pointing at this dylib for
 # install_name_tool to fix up.
 install_name_tool -id "@rpath/libpdfium.dylib" "$FRAMEWORK_DYLIB"
 

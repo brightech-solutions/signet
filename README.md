@@ -1,4 +1,4 @@
-# PDF Utility
+# Signet
 
 A small, native macOS desktop app for viewing, filling, and signing PDFs —
 nothing more. Built to be a personal, fully offline alternative to Adobe
@@ -23,9 +23,10 @@ outside the app bundle, and the app never makes network calls.
 - **Apply** — a separate, explicit action that permanently flattens all
   additions into the page content and locks the document from further
   editing, in this app or any other PDF tool.
-- Opening a PDF works both from File → Open and by double-clicking /
-  "Open With" from Finder, once macOS has been told this app can open PDFs
-  (see Known Limitations below).
+- Opening a PDF works both from File → Open and from Finder — double-click,
+  or right-click → Open With — via a small `NSApplicationDelegate` that
+  catches the file-open event Finder sends (macOS never passes this as a
+  command-line argument the way a direct launch does).
 
 ## Building and running from source
 
@@ -40,8 +41,8 @@ cargo run -- path/to/file.pdf   # optional: opens a file on launch
 ## Packaging a `.app` / `.dmg`
 
 ```bash
-./packaging/bundle.sh    # builds dist/PDF Utility.app (universal binary)
-./packaging/make_dmg.sh  # also wraps it into dist/PDF Utility.dmg
+./packaging/bundle.sh    # builds dist/Signet.app (universal binary)
+./packaging/make_dmg.sh  # also wraps it into dist/Signet.dmg
 ```
 
 `make_dmg.sh` calls `bundle.sh` internally, so running it alone produces
@@ -50,8 +51,8 @@ launch requires right-click → **Open** (or approving it under System
 Settings → Privacy & Security → "Open Anyway") to get past Gatekeeper.
 After that, double-click and Finder "Open With" work normally.
 
-To install: drag `dist/PDF Utility.app` into `/Applications`, or open
-`dist/PDF Utility.dmg` and drag the app onto the `Applications` shortcut
+To install: drag `dist/Signet.app` into `/Applications`, or open
+`dist/Signet.dmg` and drag the app onto the `Applications` shortcut
 inside it.
 
 ## Running tests
@@ -64,7 +65,8 @@ cargo test
 
 - `src/` — application source (`app.rs` is the main UI/state; `document.rs`,
   `form_fields.rs`, `overlay.rs`, `annotations.rs`, `apply.rs`, `save.rs`,
-  `signatures.rs` split out the PDF/document logic).
+  `signatures.rs` split out the PDF/document logic; `macos_open.rs` handles
+  Finder-initiated opens).
 - `packaging/` — `Info.plist`, `bundle.sh`, `make_dmg.sh`, and the icon
   generator script.
 - `assets/` — bundled font (typed signatures) and app icon.

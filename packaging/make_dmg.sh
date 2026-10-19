@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# packaging/make_dmg.sh — builds "PDF Utility.app" (via bundle.sh) and wraps
-# it in a drag-to-install "PDF Utility.dmg".
+# packaging/make_dmg.sh — builds "Signet.app" (via bundle.sh) and wraps
+# it in a drag-to-install "Signet.dmg".
 #
 # The .dmg mounts with the app on the left and an /Applications shortcut on
 # the right, so opening it and dragging the app over is the whole install.
@@ -20,10 +20,10 @@ command -v hdiutil >/dev/null 2>&1 || {
     exit 1
 }
 
-APP_NAME="PDF Utility.app"
+APP_NAME="Signet.app"
 DIST_DIR="$REPO_ROOT/dist"
 APP_DIR="$DIST_DIR/$APP_NAME"
-DMG_NAME="PDF Utility.dmg"
+DMG_NAME="Signet.dmg"
 DMG_PATH="$DIST_DIR/$DMG_NAME"
 STAGING_DIR="$DIST_DIR/.dmg-staging"
 
@@ -42,7 +42,7 @@ cp -R "$APP_DIR" "$STAGING_DIR/"
 ln -s /Applications "$STAGING_DIR/Applications"
 
 echo "==> Creating $DMG_NAME"
-hdiutil create -volname "PDF Utility" \
+hdiutil create -volname "Signet" \
     -srcfolder "$STAGING_DIR" \
     -ov -format UDZO \
     "$DMG_PATH"

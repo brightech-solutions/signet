@@ -1,4 +1,4 @@
-use pdf_utility::overlay::{
+use signet::overlay::{
     OverlayElement, OverlayLayer, SignatureElement, TextBoxElement, clamp_to_page,
 };
 use uuid::Uuid;

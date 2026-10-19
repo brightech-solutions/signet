@@ -1,4 +1,4 @@
-use pdf_utility::document::{DocumentError, PdfDocumentState};
+use signet::document::{DocumentError, PdfDocumentState};
 use std::path::Path;
 
 #[test]

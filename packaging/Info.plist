@@ -3,15 +3,15 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleExecutable</key>
-	<string>pdf_utility</string>
+	<string>signet</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.brightech.pdfutility</string>
+	<string>com.brightech.signet</string>
 	<key>CFBundleName</key>
-	<string>PDF Utility</string>
+	<string>Signet</string>
 	<key>CFBundleDisplayName</key>
-	<string>PDF Utility</string>
+	<string>Signet</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

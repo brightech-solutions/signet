@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use pdf_utility::signatures::{DEFAULT_FONT_ID, SCRIPT_FONT_ID, SignatureLibrary, SignatureSource};
+use signet::signatures::{DEFAULT_FONT_ID, SCRIPT_FONT_ID, SignatureLibrary, SignatureSource};
 use uuid::Uuid;
 
 /// The egui font name [`SCRIPT_FONT_ID`] resolves to. Must match the name
@@ -34,9 +34,9 @@ pub const SCRIPT_FONT_NAME: &str = "ShadowsIntoLight";
 
 /// Font choices offered in the "Add typed…" dropdown: a stable `font_id`
 /// (persisted verbatim in `SignatureEntry::source`, see
-/// `pdf_utility::signatures::SignatureSource::Typed`) paired with the label
+/// `signet::signatures::SignatureSource::Typed`) paired with the label
 /// shown in the dropdown. `SCRIPT_FONT_ID`/`DEFAULT_FONT_ID` are defined in
-/// `pdf_utility::signatures` (not here) so that
+/// `signet::signatures` (not here) so that
 /// `signatures::render_signature_entry` — which renders a typed entry's
 /// text at placement time — matches against the exact same ids this
 /// dropdown writes, with no second copy of the strings to drift out of
@@ -95,9 +95,9 @@ impl SignaturePanelState {
     ///
     /// Returns the id of a library entry the user clicked "Place on page"
     /// for this frame, if any — placement itself (rendering the entry via
-    /// `pdf_utility::signatures::render_signature_entry` and dropping it
+    /// `signet::signatures::render_signature_entry` and dropping it
     /// onto the canvas on the next click) is driven by the caller
-    /// (`PdfUtilityApp`), which owns the canvas and the overlay layer this
+    /// (`SignetApp`), which owns the canvas and the overlay layer this
     /// panel has no access to.
     ///
     /// `locked` is `true` once the open document has been flattened via

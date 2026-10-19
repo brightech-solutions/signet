@@ -4,7 +4,7 @@
 
 #![allow(dead_code)] // each test crate uses a different subset
 
-use pdf_utility::document::PdfDocumentState;
+use signet::document::PdfDocumentState;
 
 /// Counts "ink" pixels — opaque and darker than mid-grey — inside
 /// `page_rect` (page space: PDF points, origin top-left) of an image
@@ -62,7 +62,7 @@ pub fn app_annotation_count_in_file(path: &std::path::Path, page_number: u32) ->
             dict.and_then(|dict| dict.get(b"T").ok())
                 .and_then(|title| lopdf::decode_text_string(title).ok())
                 .as_deref()
-                == Some(pdf_utility::annotations::APP_MARKER)
+                == Some(signet::annotations::APP_MARKER)
         })
         .count()
 }

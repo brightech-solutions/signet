@@ -1,6 +1,6 @@
-"""Generates the PDF Utility app icon: a blue rounded-square background, a
-white page with a folded corner and text lines (view/fill), and an orange
-pen squiggle (sign) crossing the bottom-right corner.
+"""Generates the Signet app icon: a blue rounded-square background holding
+a wax-seal medallion, embossed with an "S" set in the app's own bundled
+handwriting font (the same one used for typed signatures).
 
 Requires Pillow (`pip install Pillow`) and macOS's `iconutil` to finish the
 conversion to .icns.
@@ -10,11 +10,11 @@ Usage:
     iconutil -c icns <output_dir>/AppIcon.iconset -o assets/icon/AppIcon.icns
 """
 import sys
-import math
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 CANVAS = 1024
+FONT_PATH = Path(__file__).resolve().parent.parent / "assets" / "fonts" / "ShadowsIntoLight.ttf"
 
 
 def build_master() -> Image.Image:
@@ -45,76 +45,55 @@ def build_master() -> Image.Image:
     )
     img = Image.composite(Image.alpha_composite(img, highlight), img, mask)
 
-    # The page.
-    page_left, page_top = 320, 220
-    page_right, page_bottom = 760, 860
-    fold = 110  # folded-corner size, top-right
+    # The wax seal: a round medallion, slightly uneven at the rim like a
+    # real dripped-wax seal, with a drop shadow and an embossed ring.
+    cx, cy, r = 512, 540, 300
 
-    page_points = [
-        (page_left, page_top),
-        (page_right - fold, page_top),
-        (page_right, page_top + fold),
-        (page_right, page_bottom),
-        (page_left, page_bottom),
-    ]
-    # Soft shadow under the page.
     shadow = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
     sdraw = ImageDraw.Draw(shadow)
-    sdraw.polygon([(x + 14, y + 20) for x, y in page_points], fill=(0, 0, 0, 70))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(18))
+    sdraw.ellipse([cx - r + 10, cy - r + 22, cx + r + 10, cy + r + 22], fill=(0, 0, 0, 90))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(20))
     img = Image.alpha_composite(img, shadow)
     draw = ImageDraw.Draw(img)
 
-    draw.polygon(page_points, fill=(255, 255, 255, 255))
-    # Folded corner flap.
-    draw.polygon(
-        [
-            (page_right - fold, page_top),
-            (page_right, page_top + fold),
-            (page_right - fold, page_top + fold),
-        ],
-        fill=(206, 219, 236, 255),
+    wax = (122, 24, 38, 255)
+    wax_dark = (92, 16, 28, 255)
+    # A few small drips bulging past the main circle for an authentic,
+    # hand-pressed edge rather than a perfect circle.
+    for dx, dy, dr in [(-220, 190, 46), (200, 205, 52), (-60, 250, 40), (90, 240, 44)]:
+        draw.ellipse(
+            [cx + dx - dr, cy + dy - dr, cx + dx + dr, cy + dy + dr], fill=wax_dark
+        )
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=wax)
+
+    # Inner embossed ring, as if pressed by a signet ring's bezel.
+    ring_r = r - 38
+    draw.ellipse(
+        [cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r],
+        outline=wax_dark,
+        width=10,
     )
 
-    # Text lines on the page (view/fill).
-    line_color = (170, 184, 204, 255)
-    line_left = page_left + 60
-    line_right = page_right - 60
-    for i, y in enumerate(range(page_top + 160, page_top + 420, 70)):
-        right = line_right if i != 2 else line_right - 140
-        draw.rounded_rectangle([line_left, y, right, y + 26], radius=13, fill=line_color)
-
-    # Pen/signature squiggle (sign), crossing the lower-right of the page.
-    squiggle_color = (240, 140, 30, 255)
-    cx, cy = page_right - 60, page_bottom - 90
-    points = []
-    for i in range(60):
-        t = i / 59
-        x = cx - 420 + t * 420
-        y = cy + 60 * math.sin(t * math.pi * 2.4) * (1 - t * 0.3)
-        points.append((x, y))
-    draw.line(points, fill=squiggle_color, width=34, joint="curve")
-    for p in (points[0], points[-1]):
-        r = 17
-        draw.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=squiggle_color)
-    # Pen nib at the end of the stroke.
-    nib_tip = points[-1]
-    nib_dx = points[-1][0] - points[-5][0]
-    nib_dy = points[-1][1] - points[-5][1]
-    norm = math.hypot(nib_dx, nib_dy) or 1
-    nib_dx, nib_dy = nib_dx / norm, nib_dy / norm
-    nib_len = 70
-    nib_tail = (nib_tip[0] - nib_dx * nib_len, nib_tip[1] - nib_dy * nib_len)
-    perp = (-nib_dy, nib_dx)
-    half_w = 20
-    draw.polygon(
-        [
-            (nib_tail[0] + perp[0] * half_w, nib_tail[1] + perp[1] * half_w),
-            (nib_tail[0] - perp[0] * half_w, nib_tail[1] - perp[1] * half_w),
-            (nib_tip[0] - nib_dx * 8, nib_tip[1] - nib_dy * 8),
-        ],
-        fill=(60, 60, 64, 255),
+    # Soft highlight, upper-left, for a rounded, glossy wax look.
+    highlight = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
+    hdraw = ImageDraw.Draw(highlight)
+    hdraw.ellipse(
+        [cx - r * 0.55, cy - r * 0.95, cx + r * 0.35, cy - r * 0.1],
+        fill=(255, 255, 255, 60),
     )
+    highlight = highlight.filter(ImageFilter.GaussianBlur(40))
+    img = Image.alpha_composite(img, highlight)
+    draw = ImageDraw.Draw(img)
+
+    # The embossed initial, set in the app's own handwriting font.
+    font = ImageFont.truetype(str(FONT_PATH), 360)
+    letter = "S"
+    bbox = draw.textbbox((0, 0), letter, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    tx, ty = cx - tw / 2 - bbox[0], cy - th / 2 - bbox[1]
+    emboss = (224, 198, 150, 255)
+    draw.text((tx + 6, ty + 8), letter, font=font, fill=wax_dark)
+    draw.text((tx, ty), letter, font=font, fill=emboss)
 
     return img
 

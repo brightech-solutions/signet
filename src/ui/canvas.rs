@@ -10,7 +10,7 @@
 ///
 /// `screen = page_point * zoom - scroll_offset`.
 ///
-/// First called from `PdfUtilityApp` as of Task 4, to position the inline
+/// First called from `SignetApp` as of Task 4, to position the inline
 /// text-field editor over a clicked AcroForm field; `scroll_offset` is
 /// `-image_response.rect.min.to_vec2()`, i.e. the negative of where the
 /// rendered page image's page-space origin currently sits on screen (which

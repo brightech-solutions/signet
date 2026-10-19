@@ -3,10 +3,10 @@ mod common;
 use std::path::Path;
 
 use common::ink_in;
-use pdf_utility::document::PdfDocumentState;
-use pdf_utility::overlay::OverlayLayer;
-use pdf_utility::save::save;
-use pdf_utility::form_fields::{
+use signet::document::PdfDocumentState;
+use signet::overlay::OverlayLayer;
+use signet::save::save;
+use signet::form_fields::{
     FieldKind, fields_on_page, get_field_value, hit_test, set_field_value,
 };
 

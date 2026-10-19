@@ -1,4 +1,4 @@
-use pdf_utility::signature_image::strip_light_background;
+use signet::signature_image::strip_light_background;
 
 #[test]
 fn near_white_pixels_become_transparent() {

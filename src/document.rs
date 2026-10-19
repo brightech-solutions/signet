@@ -51,7 +51,7 @@ static PDFIUM: OnceCell<Pdfium> = OnceCell::new();
 /// Resolves the path to the pdfium dynamic library to load.
 ///
 /// When running inside a packaged `.app` bundle (Task 11), the executable
-/// lives at `PDF Utility.app/Contents/MacOS/pdf_utility` and the universal
+/// lives at `Signet.app/Contents/MacOS/signet` and the universal
 /// pdfium dylib is bundled alongside it at `Contents/Frameworks/libpdfium.dylib`.
 /// That bundled copy is preferred when present, since the packaged app may be
 /// launched with an arbitrary working directory (e.g. from Finder) where the
@@ -62,7 +62,7 @@ static PDFIUM: OnceCell<Pdfium> = OnceCell::new();
 /// directory), which is what `cargo run`/`cargo test` use during development.
 fn vendored_library_path() -> PathBuf {
     if let Ok(exe_path) = std::env::current_exe() {
-        // Contents/MacOS/pdf_utility -> Contents/Frameworks/libpdfium.dylib
+        // Contents/MacOS/signet -> Contents/Frameworks/libpdfium.dylib
         if let Some(macos_dir) = exe_path.parent() {
             let bundled = macos_dir
                 .join("..")

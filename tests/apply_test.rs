@@ -10,12 +10,12 @@ mod common;
 use std::path::Path;
 
 use common::ink_in;
-use pdf_utility::annotations::read_overlay_from_annotations;
-use pdf_utility::apply::{apply, flatten};
-use pdf_utility::document::PdfDocumentState;
-use pdf_utility::form_fields::{fields_on_page, set_field_value};
-use pdf_utility::overlay::{OverlayElement, OverlayLayer, SignatureElement, TextBoxElement};
-use pdf_utility::save::save;
+use signet::annotations::read_overlay_from_annotations;
+use signet::apply::{apply, flatten};
+use signet::document::PdfDocumentState;
+use signet::form_fields::{fields_on_page, set_field_value};
+use signet::overlay::{OverlayElement, OverlayLayer, SignatureElement, TextBoxElement};
+use signet::save::save;
 use uuid::Uuid;
 
 const TEXT_RECT: egui::Rect = egui::Rect {

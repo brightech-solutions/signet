@@ -1,10 +1,12 @@
 mod app;
+#[cfg(target_os = "macos")]
+mod macos_open;
 mod ui;
 
 use std::path::PathBuf;
 
-use app::PdfUtilityApp;
-use pdf_utility::document;
+use app::SignetApp;
+use signet::document;
 use ui::signature_panel::SCRIPT_FONT_NAME;
 
 /// The bundled handwriting font for typed signatures: "Shadows Into Light"
@@ -21,12 +23,22 @@ fn main() -> eframe::Result<()> {
         eprintln!("Failed to initialize pdfium: {err}");
     }
 
-    // Finder "Open With" / double-click launches pass the file path as the
-    // first argument; `cargo run -- <path>` exercises the same path.
+    // A direct CLI launch (`cargo run -- <path>`) passes the file path as
+    // the first argument. A Finder-initiated open (double-click, "Open
+    // With") never does — see `macos_open`'s module docs — so on macOS,
+    // `SignetApp::new` also checks that module's pending-opens queue.
     let initial_path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
 
-    eframe::run_native(
-        "PDF Utility",
+    // Building the event loop manually (rather than via `eframe::run_native`)
+    // gives us the one window `macos_open::install` needs: after the event
+    // loop exists, but before it starts running.
+    let event_loop = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build()?;
+
+    #[cfg(target_os = "macos")]
+    macos_open::install();
+
+    let mut winit_app = eframe::create_native(
+        "Signet",
         eframe::NativeOptions::default(),
         Box::new(|cc| {
             cc.egui_ctx.add_font(egui::FontInsert::new(
@@ -38,7 +50,14 @@ fn main() -> eframe::Result<()> {
                 }],
             ));
 
-            Ok(Box::new(PdfUtilityApp::new(initial_path)))
+            #[cfg(target_os = "macos")]
+            macos_open::set_repaint_context(cc.egui_ctx.clone());
+
+            Ok(Box::new(SignetApp::new(initial_path)))
         }),
-    )
+        &event_loop,
+    );
+
+    event_loop.run_app(&mut winit_app)?;
+    Ok(())
 }

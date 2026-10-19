@@ -1,4 +1,4 @@
-use pdf_utility::signatures::{
+use signet::signatures::{
     DEFAULT_FONT_ID, SCRIPT_FONT_ID, SignatureEntry, SignatureLibrary, SignatureSource,
     render_signature_entry,
 };
