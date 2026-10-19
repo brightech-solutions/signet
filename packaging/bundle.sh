@@ -93,9 +93,16 @@ echo "==> Creating universal binary"
 lipo -create -output "$APP_DIR/Contents/MacOS/$BIN_NAME" "$ARM64_BIN" "$X86_64_BIN"
 chmod +x "$APP_DIR/Contents/MacOS/$BIN_NAME"
 
-# --- Step 5: Info.plist ---------------------------------------------------
+# --- Step 5: Info.plist + app icon -----------------------------------------
 
 cp "$SCRIPT_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
+
+ICON_SRC="$REPO_ROOT/assets/icon/AppIcon.icns"
+[ -f "$ICON_SRC" ] || {
+    echo "error: expected app icon missing: $ICON_SRC" >&2
+    exit 1
+}
+cp "$ICON_SRC" "$APP_DIR/Contents/Resources/AppIcon.icns"
 
 # --- Step 6: universal pdfium dylib via lipo ------------------------------
 
