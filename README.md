@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon/icon.png" alt="Signet app icon" width="160">
+</p>
+
 # Signet
 
 A small, native macOS desktop app for viewing, filling, and signing PDFs —
@@ -69,7 +73,8 @@ cargo test
   Finder-initiated opens).
 - `packaging/` — `Info.plist`, `bundle.sh`, `make_dmg.sh`, and the icon
   generator script.
-- `assets/` — bundled font (typed signatures) and app icon.
+- `assets/` — bundled font (typed signatures) and app icon (`icon/AppIcon.icns`
+  for the app bundle, `icon/icon.png` for display elsewhere, e.g. this README).
 - `vendor/pdfium/` — prebuilt pdfium dynamic libraries, loaded at runtime
   from inside the app bundle.
 - `tests/fixtures/` — sample PDFs used by the test suite.
